@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# локальные данные/кэш
+data/
+*.parquet
+*.csv
+*.xlsx
+
+# токены/переменные окружения
+.env
+.env.local
