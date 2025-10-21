@@ -1,6 +1,9 @@
 aiogram==3.3.0
-pandas
-openpyxl
-numpy
-requests
-python-dotenv
+pydantic==2.5.3
+pydantic-core==2.14.6
+pandas==2.2.2
+numpy==1.26.4
+openpyxl==3.1.5
+aiohttp==3.9.5
+requests==2.32.3
+python-dotenv==1.0.1
