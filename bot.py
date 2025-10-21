@@ -6534,3 +6534,43 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+    import threading
+from flask import Flask
+import os
+
+app = Flask(__name__)
+
+import threading
+from flask import Flask
+import os
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot is running!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+def main():
+    # Твой основной код запуска бота, например:
+    import asyncio
+    from aiogram import Bot, Dispatcher
+    from aiogram.types import Message
+    from aiogram.filters import CommandStart
+
+    bot = Bot(token=os.getenv("BOT_TOKEN"))
+    dp = Dispatcher()
+
+    @dp.message(CommandStart())
+    async def start(message: Message):
+        await message.answer("Привет! Бот запущен 🚀")
+
+    asyncio.run(dp.start_polling(bot))
+
+if __name__ == "__main__":
+    threading.Thread(target=run_flask).start()
+    main()
