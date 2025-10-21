@@ -7,3 +7,4 @@ XlsxWriter==3.2.0
 python-dotenv==1.0.1
 aiohttp==3.9.5
 openai==1.51.2
+tenacity==8.2.3
