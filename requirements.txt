@@ -1,8 +1,8 @@
 aiogram==3.3.0
 pydantic==2.5.3
-
-# If you use them (these all have wheels for 3.11):
 pandas==2.2.2
 numpy==1.26.4
-openpyxl==3.1.2
+openpyxl==3.1.5
 XlsxWriter==3.2.0
+python-dotenv==1.0.1
+aiohttp==3.9.5
