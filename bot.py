@@ -20,6 +20,34 @@ import re
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+from openai import OpenAI
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def chat_with_openai(prompt):
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Ты дружелюбный помощник по имени Омника, который говорит с лёгким юмором и интересуется пользователем. Отвечай естественно, коротко, но тепло."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+    return response.choices[0].message.content
+
+conversation = [
+    {"role": "system", "content": "Ты умный, эмпатичный ассистент, который ведёт непринуждённый диалог."}
+]
+
+def chat_with_memory(user_input):
+    conversation.append({"role": "user", "content": user_input})
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=conversation
+    )
+    bot_reply = response.choices[0].message.content
+    conversation.append({"role": "assistant", "content": bot_reply})
+    return bot_reply
+
+
 # --- системный промпт ---
 NLU_SYSTEM_PROMPT = """Ты — маршрутизатор запросов по outdoor-рекламе.
 Верни КОМПАКТНЫЙ JSON одной строкой без пояснений.
@@ -6525,52 +6553,43 @@ def kb_loaded() -> ReplyKeyboardMarkup:
         ]
     )
 # ====== ЗАПУСК ======
-async def main():
-    # выключаем webhook на всякий случай, чтобы не конфликтовал с polling
-    await bot.delete_webhook(drop_pending_updates=True)
-    me = await bot.get_me()
-    logging.info(f"✅ Бот @{me.username} запущен и ждёт сообщений…")
-    await dp.start_polling(bot, allowed_updates=["message"])
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-    import threading
-from flask import Flask
 import os
-
-app = Flask(__name__)
-
 import threading
+import logging
+import asyncio
 from flask import Flask
-import os
 
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot is running!"
+    return "OK: bot is running"
 
-def run_flask():
+def run_keepalive():
+    # Render пробрасывает порт в переменную среды PORT
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    # Важно слушать 0.0.0.0 и именно этот порт
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
+
+async def run_bot():
+    # если ты используешь aiogram v3:
+    # желательно на старте снять вебхук, чтобы не мешал polling
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logging.warning(f"delete_webhook warning: {e}")
+
+    me = await bot.get_me()
+    logging.info(f"✅ Бот @{me.username} запущен и ждёт сообщений…")
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 def main():
-    # Твой основной код запуска бота, например:
-    import asyncio
-    from aiogram import Bot, Dispatcher
-    from aiogram.types import Message
-    from aiogram.filters import CommandStart
+    # стартуем keepalive http-сервер в отдельном потоке
+    t = threading.Thread(target=run_keepalive, daemon=True)
+    t.start()
 
-    bot = Bot(token=os.getenv("BOT_TOKEN"))
-    dp = Dispatcher()
-
-    @dp.message(CommandStart())
-    async def start(message: Message):
-        await message.answer("Привет! Бот запущен 🚀")
-
-    asyncio.run(dp.start_polling(bot))
+    # запускаем aiogram polling в главном потоке
+    asyncio.run(run_bot())
 
 if __name__ == "__main__":
-    threading.Thread(target=run_flask).start()
     main()
