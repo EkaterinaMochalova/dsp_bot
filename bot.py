@@ -37,6 +37,36 @@ conversation = [
     {"role": "system", "content": "Ты умный, эмпатичный ассистент, который ведёт непринуждённый диалог."}
 ]
 
+import os
+import logging
+from collections import defaultdict, deque
+
+from tenacity import retry, stop_after_attempt, wait_exponential
+from openai import OpenAI
+
+# Инициализация OpenAI-клиента (без proxies!)
+_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Память короткого контекста диалога на пользователя (скользящее окно)
+DIALOG_MEMORY = defaultdict(lambda: deque(maxlen=16))  # чередуем: user/assistant
+
+SYSTEM_PROMPT = (
+    "Ты дружелюбный русскоязычный ассистент Telegram-бота. "
+    "Пиши естественно, коротко и по делу; можно эмодзи, но умеренно. "
+    "Если вопрос про код/команды — дай пример. Если вопрос неясен — уточни один вопрос. "
+    "Избегай канцелярита и резких формулировок."
+)
+
+def build_messages(user_id: int, user_text: str):
+    """
+    Собираем историю: system + последние реплики + текущий запрос.
+    """
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for role, content in DIALOG_MEMORY[user_id]:
+        msgs.append({"role": role, "content": content})
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
+
 def chat_with_memory(user_input):
     conversation.append({"role": "user", "content": user_input})
     response = client.chat.completions.create(
@@ -271,6 +301,56 @@ def _to_float(val, default):
     except Exception:
         return default
 # ---------- /helpers ----------
+
+from aiogram import F
+from aiogram.types import Message
+
+MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # можно задать через env
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
+async def llm_reply(messages):
+    """
+    Вызов OpenAI Chat Completions c автоповтором при сетевых сбоях.
+    """
+    resp = _openai.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0.7,
+        top_p=0.9,
+        max_tokens=512,
+    )
+    return resp.choices[0].message.content.strip()
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def smalltalk(message: Message):
+    text = message.text.strip()
+    user_id = message.from_user.id
+
+    # Показать "typing…" в чате
+    try:
+        await bot.send_chat_action(message.chat.id, "typing")
+    except Exception:
+        pass
+
+    try:
+        msgs = build_messages(user_id, text)
+        answer = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: llm_reply(msgs)
+        )
+        if asyncio.iscoroutine(answer):
+            answer = await answer
+
+        # Обновляем память
+        DIALOG_MEMORY[user_id].append(("user", text))
+        DIALOG_MEMORY[user_id].append(("assistant", answer))
+
+        await message.answer(answer)
+    except Exception as e:
+        logging.exception("LLM error")
+        await message.answer(
+            "Ой, что-то пошло не так 🤖 Попробуй повторить вопрос чуток позже."
+        )Ctrl+C
+
 
 # --- NL → plan params ---------------------------------------------------------
 CITY_SYNONYMS = {
