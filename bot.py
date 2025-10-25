@@ -111,6 +111,15 @@ HELP = (
 
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
+def _extract_screen_ids(frame: pd.DataFrame) -> list[str]:
+    """Безопасно достаёт список screen_id даже при дублированных колонках."""
+    if "screen_id" not in frame.columns:
+        return []
+    ser = frame["screen_id"]
+    if isinstance(ser, pd.DataFrame):   # на случай дубликатов колонок
+        ser = ser.iloc[:, 0]
+    return [s for s in ser.astype(str).tolist() if s and s.lower() != "nan"]
+
 def make_main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -1652,7 +1661,11 @@ async def pick_city(m: types.Message):
     if fields:
         view = res[fields]
         if fields == ["screen_id"]:
-            ids = [str(x) for x in view["screen_id"].tolist()]
+            # берём строго Series; при дубликатах колонок используем первую слайсом
+            ser = res["screen_id"] if "screen_id" in res.columns else pd.Series(dtype=str)
+            if isinstance(ser, pd.DataFrame):
+                ser = ser.iloc[:, 0]
+            ids = [s for s in ser.astype(str).tolist() if s and s.lower() != "nan"]
             await send_lines(m, ids, header=f"Выбрано {len(ids)} screen_id по городу «{city}»:")
         else:
             lines = [" | ".join(str(row[c]) for c in fields) for _, row in view.iterrows()]
