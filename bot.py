@@ -59,46 +59,63 @@ DEFAULT_RADIUS: float = 2.0
 USER_RADIUS: dict[int, float] = {}
 PLAN_MAX_PLAYS_PER_HOUR = 40  # лимит показов в час для планирования
 
+# ===== Places / Geocoding config =====
+GEOCODER_PROVIDER = (os.getenv("GEOCODER_PROVIDER") or "nominatim").lower()
+GOOGLE_PLACES_KEY = os.getenv("GOOGLE_PLACES_KEY") or ""   # если захочешь Google
+YANDEX_API_KEY    = os.getenv("YANDEX_API_KEY") or ""      # если захочешь Яндекс
+D2GIS_API_KEY     = os.getenv("D2GIS_API_KEY") or ""       # если захочешь 2ГИС
+
+# последнее найденное множество POI (для /near_geo без текста)
+LAST_POI: list[dict] = []
+
 # ====== Меню и help ======
 HELP = (
     "Привет ❤️ Я помогаю подбирать рекламные экраны и планировать показы.\n\n"
     "📄 Чтобы было из чего выбирать, отправь мне файл CSV/XLSX c колонками минимум: lat, lon.\n"
     "   Дополнительно поддерживаются: screen_id, name, city, format, owner, minBid / min_bid.\n\n"
 
-    "   Попробуй просто спросить:\n"
+    "💬 Попробуй просто спросить:\n"
     "   — «Подбери 10 экранов в Москве»\n"
-    "   — «Спланируй кампанию на 200 тысяч на 7 дней»\n"
-    "   — «Хочу посмотреть фасады в Питере»\n"
+    "   — «Спланируй кампанию на 30 билбордах в Москве, 7 дней, бюджет 250000»\n"
+    "   — «Хочу посмотреть 20 фасадов в Санкт-Петербурге\n"
     "   Я постараюсь подсказать подходящую команду.\n\n"
 
-    "🔎 Основные команды:\n"
+    "⚙️ Основные команды:\n"
     "• /status — что загружено и сколько экранов\n"
     "• /radius 2 — задать радиус по умолчанию (км)\n"
     "• /cache_info — диагностика локального кэша\n"
     "• /sync_api [фильтры] — подтянуть инвентарь из API (если настроены переменные окружения)\n"
+    "• /sync_api city=Москва formats=billboard,supersite size=500 pages=3 — подтянуть экраны из API\n"
+    "• /export_last — выгрузить последнюю выборку (CSV)\n\n"
+    
+    "🔎 Выбрать экраны:\n"
     "• /near <lat> <lon> [R] [filters] [fields=...] — экраны в радиусе\n"
+    "• /near 55.714349 37.553834 2 — всё в радиусе 2 км\n"
     "• /pick_city <Город> <N> [filters] [mix=...] [fields=...] — равномерная выборка по городу\n"
-    "• /pick_at <lat> <lon> <N> [R] — равномерная выборка в круге\n"
+    "• /pick_city Москва 20 format=billboard,supersite — несколько форматов\n"
+    "• /pick_at <lat> <lon> <N> [R] — равномерная выборка в круге\n\n"
+
+    "📊 Прогнозы и планы:\n"
     "• /forecast [budget=...] [days=7] [hours_per_day=8] [hours=07-10,17-21]\n"
     "• /plan budget=<сумма> [city=...] [format=...] [owner=...] [n=...] [days=...] [hours_per_day=...] [top=1] — спланировать кампанию под бюджет\n"
-    "• /export_last — выгрузить последнюю выборку (CSV)\n\n"
-
-
-
-    "🧠 Подсказки и примеры:\n"
-    "• /sync_api city=Москва formats=billboard,supersite size=500 pages=3 — подтянуть экраны из API\n"
-    "• /near 55.714349 37.553834 2 — всё в радиусе 2 км\n"
-    "• /pick_city Москва 20 format=billboard,supersite — несколько форматов\n"
     "• /plan budget=200000 city=Москва n=10 days=10 hours_per_day=8 — равномерно выбрать 10 экранов и рассчитать слоты\n\n"
 
-    "🔤 Фильтры:\n"
-    "   • format=city — все CITY_FORMAT_* (алиас «гиды»)\n"
-    "   • format=A,B | A;B | A|B — несколько форматов\n"
-    "   • owner=russ | owner=russ,gallery — фильтр по владельцу (подстрока, без учёта регистра)\n"
+    "🧭 Поиск точек на карте и подбор рядом:\n"
+    "• /geo <запрос> [city=...] [limit=5] — найти координаты по запросу\n"
+    "   Примеры:\n"
+    "   /geo Твой дом city=Москва\n"
+    "   /geo новостройки бизнес-класса city=Воронеж limit=10\n"
+    "• /near_geo [R] [fields=...] — подобрать экраны вокруг найденных точек\n"
+    "   Примеры:\n"
+    "   /near_geo 2\n"
+    "   /near_geo 1.5 fields=screen_id\n"
+    "   /near_geo 2 query=\"Твой дом\" city=Москва limit=5\n\n"
+
+    "🔤 Какие ещё фильтры можно использовать:\n"
+    "   • format=billboard — только ББ\n"
+    "   • format=billboard,supersite | billboard;supersite | billboard|supersite — несколько форматов\n"
+    "   • owner=russ | owner=РИМ,Перспектива — фильтр по владельцу (подстрока, без учёта регистра)\n"
     "   • fields=screen_id | screen_id,format — какие поля выводить\n\n"
-
-    "📦 Экспорт: команды присылают CSV/XLSX там, где это уместно.\n"
-
 )
 
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
@@ -356,6 +373,88 @@ async def send_lines(message: types.Message, lines: list[str], header: str | Non
         buf_cnt += 1
     if buf:
         await message.answer("\n".join(buf), parse_mode=parse_mode)
+
+# ===== Geocoding / Places =====
+import aiohttp, urllib.parse, asyncio
+
+async def geocode_query(query: str, *, city: str | None = None, limit: int = 5, provider: str | None = None) -> list[dict]:
+    """
+    Вернёт список dict: { 'name': str, 'lat': float, 'lon': float, 'provider': str, 'raw': any }
+    provider: 'nominatim'|'google'|'yandex'|'2gis'|'auto'
+    """
+    prov = (provider or GEOCODER_PROVIDER or "nominatim").lower()
+    if prov == "auto":
+        prov = "nominatim"
+
+    query_full = query.strip()
+    if city and city.strip():
+        # аккуратно добавим город, если его нет в запросе
+        if city.lower() not in query_full.lower():
+            query_full = f"{query_full}, {city}"
+
+    if prov == "nominatim":
+        return await _gc_nominatim(query_full, limit=limit)
+    elif prov == "google":
+        return await _gc_google(query_full, limit=limit)
+    elif prov == "yandex":
+        return await _gc_yandex(query_full, limit=limit)
+    elif prov == "2gis":
+        return await _gc_2gis(query_full, limit=limit)
+    else:
+        return await _gc_nominatim(query_full, limit=limit)
+
+
+async def _gc_nominatim(q: str, *, limit: int = 5) -> list[dict]:
+    """
+    Базовый бесплатный вариант. Важно: уважать rate limit.
+    """
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": q,
+        "limit": max(1, min(int(limit or 5), 25)),
+        "format": "jsonv2",
+        "addressdetails": 1,
+    }
+    headers = {
+        "User-Agent": "omnika-bot/1.0 (contact: admin@example.com)"
+    }
+    async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as s:
+        async with s.get(url, params=params) as r:
+            r.raise_for_status()
+            data = await r.json()
+    out = []
+    for it in data or []:
+        try:
+            out.append({
+                "name": it.get("display_name") or q,
+                "lat": float(it["lat"]),
+                "lon": float(it["lon"]),
+                "provider": "nominatim",
+                "raw": it
+            })
+        except Exception:
+            continue
+    return out
+
+
+# Заглушки под альтернативных провайдеров (если захочешь — допилишь ключи и эндпоинты)
+async def _gc_google(q: str, *, limit: int = 5) -> list[dict]:
+    if not GOOGLE_PLACES_KEY:
+        return []
+    # TODO: реализовать при необходимости (Places API / Text Search)
+    return []
+
+async def _gc_yandex(q: str, *, limit: int = 5) -> list[dict]:
+    if not YANDEX_API_KEY:
+        return []
+    # TODO: реализовать при необходимости (Geocoder API)
+    return []
+
+async def _gc_2gis(q: str, *, limit: int = 5) -> list[dict]:
+    if not D2GIS_API_KEY:
+        return []
+    # TODO: реализовать при необходимости (2GIS Search API)
+    return []
 
 # ====== SSL / HTTP helpers ======
 def _ssl_ctx_certifi() -> ssl.SSLContext:
@@ -742,303 +841,242 @@ if not BOT_TOKEN:
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
-nlu_router = Router(name="nlu")
+
+geo_router = Router(name="geo")
 router = Router()
-
-
-# ---------- NLU-подсказки по свободному тексту (safe, без конфликтов с командами) ----------
-import re
-from aiogram import Router, F, types
-from aiogram.utils.text_decorations import html_decoration as hd
-
-
 nlu_router = Router(name="nlu")
 
-# берём только обычный текст (не команды, не от ботов)
-nlu_router.message.filter(F.text, ~F.text.regexp(r"^/"), ~F.via_bot)
 
-# ===== helpers =====
+# ---------- GEO router ----------
+from aiogram import Router, F, types
+from aiogram.filters import Command
 
-def _parse_money(s: str) -> float | None:
-    s = (s or "").lower().replace(" ", "")
-    m = re.findall(r"[\d]+(?:[.,]\d+)?", s)
-    if not m:
-        return None
-    val = float(m[0].replace(",", "."))
-    if "м" in s or "m" in s:
-        val *= 1_000_000
-    elif "к" in s or "k" in s:
-        val *= 1_000
-    return val
+geo_router = Router(name="geo")
 
-def _parse_int(s: str) -> int | None:
-    m = re.search(r"\b(\d{1,6})\b", s or "")
-    return int(m.group(1)) if m else None
+# Хранилище последнего списка POI (если у тебя уже есть — оставь своё)
+LAST_POI = []
 
-def _normalize_city_token(raw: str) -> str:
-    """Переводим 'в москве', 'спб', 'питере' и т.п. к нормальному виду для команды."""
-    t = (raw or "").strip(" .,!?:;\"'()").lower()
-    t = re.sub(r"^(?:город|г\.)\s+", "", t)
-    specials = {
-        "мск": "Москва", "москва": "Москва", "в москве": "Москва", "по москве": "Москва", "из москвы": "Москва", "москве": "Москва",
-        "спб": "Санкт-Петербург", "питер": "Санкт-Петербург", "питере": "Санкт-Петербург",
-        "санкт-петербург": "Санкт-Петербург", "санкт петербург": "Санкт-Петербург",
-        "санкт-петербурге": "Санкт-Петербург", "санкт петербурге": "Санкт-Петербург",
-        "петербург": "Санкт-Петербург", "в спб": "Санкт-Петербург", "в питере": "Санкт-Петербург",
-        "казань": "Казань", "в казани": "Казань", "казани": "Казань",
-        "новосибирск": "Новосибирск", "в новосибирске": "Новосибирск", "новосибирске": "Новосибирск",
-        "екатеринбург": "Екатеринбург", "в екатеринбурге": "Екатеринбург", "екатеринбурге": "Екатеринбург", 
-        "нижний новгород": "Нижний Новгород", "в нижнем новгороде": "Нижний Новгород", "нижнем новгороде": "Нижний Новгород",
-        "тверь": "Тверь", "в твери": "Тверь", "твери": "Тверь",
-        "самара": "Самара", "в самаре": "Самара", "самаре": "Самара",
-        "ростов-на-дону": "Ростов-на-Дону", "в ростове-на-дону": "Ростов-на-Дону", "ростове-на-дону": "Ростов-на-Дону",
-        "воронеж": "Воронеж", "в воронеже": "Воронеж", "воронеже": "Воронеж",
-        "пермь": "Пермь", "в перми": "Пермь", "перми": "Пермь",
-        "уфа": "Уфа", "в уфе": "Уфа", "уфе": "Уфа",
-    }
-    if t in specials:
-        return specials[t]
-    # грубая нормализация местного падежа: Москве -> Москва, Твери -> Твери (оставим как есть)
-    if t.endswith("е") and len(t) >= 4:
-        t = t[:-1] + "а"
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    # Тайтл-кейс (для «Нижний новгород» оставим как есть — это упрощёнка)
-    return t.capitalize() if t else ""
-
-def _extract_city(text: str) -> str | None:
-    """Достаём город и возвращаем БЕЗ предлога, нормализованный."""
-    # после предлогов
-    m = re.search(r"(?:^|\s)(?:в|по|из)\s+([А-ЯA-ZЁ][\w\- ]{1,40})", text or "", flags=re.IGNORECASE)
-    if m:
-        cand = re.split(r"[,.!?:;0-9]", m.group(1).strip())[0]
-        norm = _normalize_city_token(cand)
-        return norm or None
-    # явные упоминания
-    low = (text or "").lower()
-    for key in ("москва", "мск", "спб", "санкт-петербург", "санкт петербург", "питер"):
-        if key in low:
-            return _normalize_city_token(key)
-    return None
-
-def _extract_latlon(text: str):
-    m = re.search(r"(-?\d{1,2}\.\d+)[, ]+(-?\d{1,3}\.\d+)", text or "")
-    if m:
-        try:
-            return float(m.group(1)), float(m.group(2))
-        except Exception:
-            return None
-    return None
-
-def _has_any(text: str, words: list[str]) -> bool:
-    t = (text or "").lower()
-    return any(w in t for w in words)
-
-def _extract_formats(text: str) -> list[str]:
+@geo_router.message(Command("geo"))
+async def cmd_geo(m: types.Message):
     """
-    Пытаемся понять форматы из свободного текста.
-    Возвращаем токены в том виде, как их ждут фильтры (верхний регистр),
-    чтобы apply_filters мог сравнить по точному равенству.
+    /geo <запрос> [city=...] [limit=...] [provider=nominatim|google|yandex|2gis]
+    Примеры:
+      /geo Твой дом city=Москва limit=5
+      /geo новостройки бизнес-класса city=Воронеж
     """
-    t = (text or "").lower()
-    fmts = []
+    global LAST_POI
 
-    # билборды
-    if any(w in t for w in ("billboard", "билбор", "биллбор", "билборд", "билборды", "биллборд", "биллборды", "bb", "dbb", "бб")):
-        fmts.append("BILLBOARD")
-
-    # суперсайты
-    if any(w in t for w in ("supersite", "суперсайт", "суперсайт", "суперсайты", "ss", "dss")):
-        fmts.append("SUPERSITE")
-
-    # ситиборды 
-    if any(w in t for w in ("cb", "ситик", "ситиборд", "ситиборды", "cityboard", "city board", "dcb", "сити борд", "сити борды", "сити-борд", "сити-борды")):
-        fmts.append("CITY_BOARD")
-
-    # ситиформаты 
-    if any(w in t for w in ("cf", "ситиформат", "ситиформаты", "сити форматы", "сити формат", "сити-формат", "dcf", "сити-форматы")):
-        fmts.append("CITY_FORMAT")    
-
-    # экраны на мцк 
-    if any(w in t for w in ("мцк", "экраны на мцк")):
-        fmts.append("CITY_FORMAT_RC")    
-
-    # экраны в метро 
-    if any(w in t for w in ("экраны в метро", "метро")):
-        fmts.append("CITY_FORMAT_WD")
-
-    # экраны на вокзалах 
-    if any(w in t for w in ("экраны на вокзале", "экраны на вокзалах", "вокзал", "вокзалы")):
-        fmts.append("CITY_FORMAT_RD")
-
-    # медиaфасады / фасады
-    if any(w in t for w in ("медиафасад", "медиафасады", "фасад", "фасады", "mediafacade", "media facade", "фасадов")):
-        fmts.append("MEDIAFACADE")
-    
-    # экраны в помещениях 
-    if any(w in t for w in ("индор", "индорные экраны", "экраны в помещениях", "внутри помещений", "indoor", "в ТЦ", "в тц", "торговый центр", "торговые центры")):
-        fmts.append("OTHER")
-
-    # экраны в аэропортах 
-    if any(w in t for w in ("аэропорты", "экран в аэропорту", "экран в аэропортах", "airport", "airports", "экраны в аэропорту", "экраны в аэропортах")):
-        fmts.append("SKY_DIGITAL")
-
-    # экраны в пвз 
-    if any(w in t for w in ("пвз", "экран в пвз", "экраны в пвз", "экраны в пунктах выдачи", "экран в пункте выдачи", "pickup point", "pickup points", "экран в пункте выдачи заказов", "экраны в пунктах выдачи заказов", "пвз wildberries", "пвз вб", "экран в пвз wildberries", "экраны в пвз wildberries")):
-        fmts.append("PVZ_SCREEN")
-
-
-    # уберём дубликаты, сохраним порядок первого появления
-    seen = set()
-    out = []
-    for f in fmts:
-        if f not in seen:
-            out.append(f); seen.add(f)
-    return out
-
-def _extract_owners(text: str) -> list[str]:
-    t = (text or "")
-    # ловим owner=..., а также «владелец(a/u) <слова>» и «оператор <слова>»
-    m = re.search(r"(?:owner|владелец|владельц[ау]|оператор)\s*[:=]?\s*([A-Za-zА-Яа-я0-9_\-\s,;|]+)", t, flags=re.IGNORECASE)
-    if not m:
-        return []
-    vals = re.split(r"[;,\|]\s*|\s+", m.group(1).strip())
-    vals = [v for v in vals if v and not v.isdigit()]
-    # срежем возможные хвосты после следующего параметра
-    cleaned = []
-    for v in vals:
-        if v.lower() in {"format", "city", "days", "n", "budget", "hours", "hours_per_day"}:
-            break
-        cleaned.append(v)
-    return cleaned
-
-def suggest_command_from_text(text: str) -> tuple[str | None, str]:
-    t = (text or "").strip()
-    low = t.lower()
-
-    # ---------- /plan — планирование под бюджет ----------
-    if _has_any(low, ["план", "спланируй", "на бюджет", "под бюджет", "кампан", "распред", "показы"]):
-        budget = _parse_money(low) or 200_000
-        n = _parse_int(low) or 10
-        m_days = re.search(r"(\d+)\s*дн", low)
-        days = int(m_days.group(1)) if m_days else 10
-        city_raw = _extract_city(t)
-        city = _normalize_city_token(city_raw) if city_raw else "Москва"
-        fmts = _extract_formats(low)
-        owners = _extract_owners(t)
-        top = " top=1" if _has_any(low, ["охватн", "самые охватные", "максимальный охват", "coverage"]) else ""
-        fmt_part = f" format={','.join(sorted(set(fmts)).upper() for fmts in [])}"  # placeholder (see below)
-        # ↑ маленькая хитрость ниже: правильно соберём formats
-        if fmts:
-            fmt_norm = ",".join(s.upper() for s in sorted(set(fmts)))
-            fmt_part = f" format={fmt_norm}"
-        else:
-            fmt_part = ""
-
-        own_part = f" owner={','.join(owners)}" if owners else ""
-        cmd = f"/plan budget={int(budget)} city={city} n={n} days={days}{fmt_part}{own_part}{top}"
-        return cmd, "Планирование кампании под бюджет"
-
-    # ---------- /pick_city — равномерная выборка по городу ----------
-    if _has_any(low, ["подбери", "выбери", "нужно", "хочу"]) and _has_any(low, ["в ", "по ", "из "]):
-        city_raw = _extract_city(t)
-        if city_raw:
-            city = _normalize_city_token(city_raw)
-            n = _parse_int(low) or 20
-            # форматы — только те, что явно упомянуты
-            fmts = _extract_formats(low)
-            fmt_part = f" format={','.join(s.upper() for s in sorted(set(fmts)))}" if fmts else ""
-            # владельцы — из текста после «владелец/владельца/оператор/owner»
-            owners = _extract_owners(t)
-            own_part = f" owner={','.join(owners)}" if owners else ""
-            return f"/pick_city {city} {n}{fmt_part}{own_part}", "Равномерная выборка по городу"
-
-    # ---------- /near — экраны рядом / в радиусе ----------
-    latlon = _extract_latlon(t)
-    if latlon or _has_any(low, ["рядом", "около", "в радиусе", "вокруг", "near", "поблизости"]):
-        if latlon:
-            return f"/near {latlon[0]:.6f} {latlon[1]:.6f} 2", "Экраны в радиусе точки (пример: 2 км)"
-        else:
-            return "📍 Пришлите геолокацию или используйте: /near <lat> <lon> 2", "Экраны вокруг вашей точки"
-
-    # ---------- /forecast — оценка показов для последней выборки ----------
-    if _has_any(low, ["сколько показ", "прогноз", "forecast", "хватит ли", "оценка показов"]):
-        budget = _parse_money(low)
-        if budget:
-            return f"/forecast budget={int(budget)} days=7 hours_per_day=8", "Оценка по последней выборке"
-        else:
-            return "/forecast days=7 hours_per_day=8", "Оценка по последней выборке"
-
-    # ---------- /sync_api — подтянуть инвентарь из API ----------
-    if _has_any(low, ["обнови список", "подтяни из апи", "синхронизируй", "обнови экраны", "sync api"]):
-        fmts = _extract_formats(low)
-        city_raw = _extract_city(t)
-        city = _normalize_city_token(city_raw) if city_raw else None
-        parts = []
-        if city: parts.append(f"city={city}")
-        if fmts: parts.append(f"formats={','.join(s.upper() for s in sorted(set(fmts)))}")
-        base = "/sync_api " + " ".join(parts) if parts else "/sync_api size=500 pages=3"
-        return base.strip(), "Синхронизация инвентаря из API"
-
-    # ---------- /shots — фотоотчёт по кампании ----------
-    if _has_any(low, ["фотоотчет", "фото отчёт", "кадры кампании", "impression", "shots"]):
-        camp = _parse_int(low) or 0
-        if camp > 0:
-            return f"/shots campaign={camp} per=0 limit=100", "Фотоотчёт по кампании"
-        else:
-            return "/shots campaign=<ID> per=0 limit=100", "Фотоотчёт: укажите campaign ID"
-
-    # ---------- /export_last — экспорт ----------
-    if _has_any(low, ["выгрузи", "экспорт", "csv", "xlsx", "таблица"]):
-        return "/export_last", "Экспорт последней выборки"
-
-    # ---------- /radius — изменить радиус ----------
-    if _has_any(low, ["радиус", "поставь радиус", "изменить радиус"]):
-        r = _parse_int(low) or 2
-        return f"/radius {r}", "Задать радиус по умолчанию (км)"
-
-    # ---------- /status /help ----------
-    if _has_any(low, ["статус", "что загружено", "сколько экранов"]):
-        return "/status", "Статус загруженных данных"
-    if _has_any(low, ["help", "помощ", "что умеешь", "команды"]):
-        return "/help", "Справка по командам"
-
-    # Ничего не распознали — мягко отправляем к /help и @enterspring
-    return None, "Похоже, готовой команды для этого нет. Напишите, пожалуйста, @enterspring — она поможет добавить нужную функцию."
-
-# ===== хэндлер =====
-
-@nlu_router.message()
-async def natural_language_assistant(m: types.Message):
     text = (m.text or "").strip()
-    cmd, hint = suggest_command_from_text(text)
+    parts = text.split()[1:]  # всё после /geo
 
-    # глушим странные невидимые символы, чтобы не ломали HTML
-    def _clean(s: str) -> str:
-        return (s or "").replace("\u200b", "").replace("\ufeff", "").strip()
+    if not parts:
+        await m.answer("Формат: /geo <запрос> [city=...] [limit=5] [provider=nominatim]")
+        return
 
-    hint = _clean(hint)
-    cmd  = _clean(cmd) if cmd else None
+    # Разделяем позиционный запрос и key=value опции
+    query_tokens, kv = [], {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            kv[k.strip().lower()] = v.strip()
+        else:
+            query_tokens.append(p)
 
-    # Собираем ответ ТОЛЬКО через hd.*, без «ручных» <b>/<i>/<code>
-    header = "Похоже, сработает это:"
-    parts = [hd.quote(header), ""]  # пустая строка = перенос
+    query = " ".join(query_tokens).strip()
+    if not query:
+        await m.answer("Нужен текст запроса. Пример: /geo Твой дом city=Москва limit=5")
+        return
 
-    if cmd:
-        # Если это команда — показываем в <code>, иначе просто как текст
-        line = hd.bold("Советую команду") + " 👉 " + (hd.code(cmd) if cmd.startswith("/") else hd.quote(cmd))
-        parts.append(line)
-        if hint:
-            parts += ["", hd.italic(hint)]
-        body = "\n".join(parts)
-    else:
-        # Нет подходящей команды — мягко шлём к /help и @enterspring
-        tail = "А пока можно посмотреть доступные команды: /help"
-        body = hd.quote(hint) + "\n\n" + hd.quote(tail)
+    city = kv.get("city")
+    try:
+        limit = int(kv.get("limit", "5") or 5)
+        if limit <= 0 or limit > 50:
+            raise ValueError
+    except Exception:
+        limit = 5
 
-    await m.answer(body, parse_mode="HTML", disable_web_page_preview=True)
+    provider = (kv.get("provider") or "nominatim").strip().lower()
+    if provider not in {"nominatim", "google", "yandex", "2gis"}:
+        provider = "nominatim"
 
-# Подключение NLU-роутера ДОЛЖНО быть выше, чем основной:
-dp.include_router(nlu_router)
+    where = f" в городе {city}" if city else ""
+    await m.answer(f"🔎 Ищу точки по запросу «{query}»{where}…")
+
+    try:
+        # ожидается твоя async-функция geocode_query(query, city=..., limit=..., provider=...)
+        pois = await geocode_query(query, city=city, limit=limit, provider=provider)
+    except Exception as e:
+        await m.answer(f"🚫 Геокодер ответил ошибкой: {e}")
+        return
+
+    if not pois:
+        await m.answer("Ничего не нашёл. Попробуйте уточнить запрос или сменить provider.")
+        return
+
+    LAST_POI = pois
+
+    # Красивый список
+    lines = []
+    for i, p in enumerate(pois, 1):
+        nm = p.get("name") or p.get("address") or "Без названия"
+        plat = float(p.get("lat"))
+        plon = float(p.get("lon"))
+        prov = p.get("provider") or provider
+        lines.append(f"{i}. {nm}\n   [{plat:.6f}, {plon:.6f}] ({prov})")
+
+    await m.answer(
+        "📍 Найденные точки:\n\n" + "\n".join(lines) +
+        "\n\nТеперь можно: /near_geo 2  — подобрать экраны в радиусе 2 км от каждой точки"
+    )
+
+
+# ---------- /near_geo (в том же geo_router) ----------
+from aiogram import types
+from aiogram.filters import Command
+
+@geo_router.message(Command("near_geo"))
+async def cmd_near_geo(m: types.Message):
+    """
+    /near_geo [R] [fields=screen_id] [dedup=1] [query=...] [city=...] [limit=...] [provider=nominatim|google|yandex|2gis]
+    Варианты:
+      1) сначала /geo ... ; потом /near_geo 2
+      2) сразу: /near_geo 2 query="Твой дом" city=Москва limit=5
+    """
+    global SCREENS, LAST_RESULT, LAST_POI, USER_RADIUS, DEFAULT_RADIUS
+
+    # проверим, что инвентарь загружен
+    if SCREENS is None or getattr(SCREENS, "empty", True):
+        await m.answer("Сначала загрузите инвентарь (CSV/XLSX или /sync_api).")
+        return
+
+    text = (m.text or "").strip()
+    tail = text.split()[1:]  # всё после /near_geo
+
+    # --- парсим радиус, если первый токен без '=' ---
+    radius_km = USER_RADIUS.get(m.from_user.id, DEFAULT_RADIUS)
+    start_i = 0
+    if tail and "=" not in tail[0]:
+        try:
+            radius_km = float(tail[0].strip("[](){}"))
+            start_i = 1
+        except Exception:
+            pass
+
+    # --- парсим key=value ---
+    kv: dict[str, str] = {}
+    for p in tail[start_i:]:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            kv[k.strip().lower()] = v.strip().strip('"').strip("'")
+
+    fields_req = (kv.get("fields") or "").strip()
+    dedup = str(kv.get("dedup", "1")).lower() in {"1", "true", "yes", "on"}
+
+    # --- если указан query=, выполняем геопоиск на лету ---
+    if "query" in kv:
+        q = kv.get("query") or ""
+        city = kv.get("city")
+        try:
+            limit = int(kv.get("limit", "5") or 5)
+        except Exception:
+            limit = 5
+        provider = (kv.get("provider") or "nominatim").strip().lower()
+        if provider not in {"nominatim", "google", "yandex", "2gis"}:
+            provider = "nominatim"
+
+        where = f" в {city}" if city else ""
+        await m.answer(f"🔎 Ищу точки «{q}»{where}…")
+        try:
+            # ожидается твоя async-функция geocode_query(query, city=..., limit=..., provider=...)
+            LAST_POI = await geocode_query(q, city=city, limit=limit, provider=provider)
+        except Exception as e:
+            await m.answer(f"🚫 Геокодер ответил ошибкой: {e}")
+            return
+
+    pois = LAST_POI or []
+    if not pois:
+        await m.answer("Сначала найдите точки: /geo <запрос> [city=...] — или используйте /near_geo R query=…")
+        return
+
+    await m.answer(f"🧭 Подбираю экраны в радиусе {radius_km} км вокруг {len(pois)} точек…")
+
+    # --- собираем экраны вокруг каждой точки ---
+    frames = []
+    for p in pois:
+        try:
+            plat = float(p["lat"]); plon = float(p["lon"])
+        except Exception:
+            continue
+        df = find_within_radius(SCREENS, (plat, plon), radius_km)
+        if df is not None and not df.empty:
+            df = df.copy()
+            df["poi_name"] = p.get("name") or p.get("address") or ""
+            df["poi_lat"]  = plat
+            df["poi_lon"]  = plon
+            frames.append(df)
+
+    if not frames:
+        await m.answer("В выбранных радиусах подходящих экранов не нашлось.")
+        return
+
+    import pandas as pd  # на случай, если не было импортировано выше
+    res = pd.concat(frames, ignore_index=True)
+
+    # --- удалим дубликаты экранов, если нужно ---
+    if dedup and "screen_id" in res.columns:
+        res = res.drop_duplicates(subset=["screen_id"]).reset_index(drop=True)
+
+    LAST_RESULT = res
+
+    # --- если запросили конкретные поля — отдаём компактный CSV ---
+    if fields_req:
+        cols = [c.strip() for c in fields_req.split(",") if c.strip()]
+        cols = [c for c in cols if c in res.columns]
+        if not cols:
+            await m.answer("Поля не распознаны. Доступные: " + ", ".join(res.columns))
+            return
+        view = res[cols].copy()
+        csv_bytes = view.to_csv(index=False).encode("utf-8-sig")
+        await bot.send_document(
+            m.chat.id,
+            BufferedInputFile(csv_bytes, filename="near_geo_selection.csv"),
+            caption=f"Экраны рядом с найденными POI (поля: {', '.join(cols)})"
+        )
+        return
+
+    # --- человекочитаемый список (усечём, чтобы не спамить) ---
+    lines = []
+    show = res.head(120)
+    for _, r in show.iterrows():
+        nm = (r.get("name") or r.get("screen_id") or "").strip()
+        fmt = (r.get("format") or "").strip()
+        own = (r.get("owner") or "").strip()
+        poi = (r.get("poi_name") or "").strip()
+        dist = r.get("distance_km")
+        dist_txt = f"{dist} км" if dist not in (None, "") else ""
+        lines.append(f"• {r.get('screen_id','')} — {nm} [{fmt}/{own}] — {dist_txt} от «{poi}»")
+
+    await send_lines(
+        m,
+        lines,
+        header=f"Найдено {len(res)} экранов рядом с {len(pois)} точками (радиус {radius_km} км)",
+        chunk=60
+    )
+
+    # --- полный CSV на руки ---
+    try:
+        csv_bytes = res.to_csv(index=False).encode("utf-8-sig")
+        await bot.send_document(
+            m.chat.id,
+            BufferedInputFile(csv_bytes, filename="near_geo_full.csv"),
+            caption=f"Полный список {len(res)} экранов (CSV)"
+        )
+    except Exception:
+        pass
+
+
+dp.include_router(geo_router)
+
 
 # ---------- базовые команды ----------
 @router.message(Command("start"))
@@ -1070,6 +1108,7 @@ async def cache_info(m: Message):
         await m.answer("\n".join(lines))
     except Exception as e:
         await m.answer(f"cache_info error: {e}")
+
 
 # ---------- статус ----------
 @router.message(Command("status"))
@@ -2051,7 +2090,7 @@ async def on_file(m: types.Message):
 async def fallback_text(m: types.Message):
     t = (m.text or "").strip()
     if t.startswith("/"):
-        await m.answer("Я вас понял, но такой команды нет. Нажмите /help для списка возможностей.", reply_markup=make_main_menu())
+        await m.answer("Я вас поняла, но такой команды нет. Нажмите /help для списка возможностей.", reply_markup=make_main_menu())
     else:
         await m.answer(
             "Чтобы начать, пришлите файл CSV/XLSX с экранами, или используйте /near, /pick_city, /pick_at.\n"
@@ -2061,6 +2100,330 @@ async def fallback_text(m: types.Message):
 
 # ---------- Регистрация роутера и запуск ----------
 dp.include_router(router)
+
+# ---------- NLU-подсказки по свободному тексту (safe, без конфликтов с командами) ----------
+import re
+from aiogram import Router, F, types
+from aiogram.utils.text_decorations import html_decoration as hd
+
+# берём только обычный текст (не команды, не от ботов)
+nlu_router.message.filter(F.text, ~F.text.regexp(r"^/"), ~F.via_bot)
+
+# ===== helpers =====
+
+def _parse_money(s: str) -> float | None:
+    """
+    Ищет сумму денег в тексте.
+    Приоритет: 'бюджет ...' -> иначе первое подходящее число.
+    Поддержка суффиксов: к/K (тыс), м/M (млн).
+    Примеры: '250000', '250 000', '200к', '1.5м', 'бюджет 250k'
+    """
+    if not s:
+        return None
+    t = s.lower()
+
+    # 1) Сперва пытаемся найти конструкцию с ключевым словом "бюджет"
+    m = re.search(
+        r"(?:бюджет|budget)\s*[:=]?\s*"
+        r"(\d{1,3}(?:[ \u00A0]?\d{3})+|\d+(?:[.,]\d+)?)\s*([кkмm])?\b",
+        t,
+        flags=re.IGNORECASE
+    )
+    if not m:
+        # 2) Иначе — первое "самостоятельное" число с возможным суффиксом
+        m = re.search(
+            r"\b(\d{1,3}(?:[ \u00A0]?\d{3})+|\d+(?:[.,]\d+)?)\s*([кkмm])?\b",
+            t,
+            flags=re.IGNORECASE
+        )
+    if not m:
+        return None
+
+    num = m.group(1)
+    suf = (m.group(2) or "").lower()
+
+    # убираем пробелы-разделители тысяч и приводим запятую к точке
+    num = num.replace(" ", "").replace("\u00A0", "").replace(",", ".")
+    try:
+        val = float(num)
+    except ValueError:
+        return None
+
+    if suf == "м" or suf == "m":
+        val *= 1_000_000
+    elif suf == "к" or suf == "k":
+        val *= 1_000
+
+    return val
+
+def _parse_int(s: str) -> int | None:
+    m = re.search(r"\b(\d{1,6})\b", s or "")
+    return int(m.group(1)) if m else None
+
+def _normalize_city_token(raw: str) -> str:
+    """Переводим 'в москве', 'спб', 'питере' и т.п. к нормальному виду для команды."""
+    t = (raw or "").strip(" .,!?:;\"'()").lower()
+    t = re.sub(r"^(?:город|г\.)\s+", "", t)
+    specials = {
+        "мск": "Москва", "москва": "Москва", "в москве": "Москва", "по москве": "Москва", "из москвы": "Москва", "москве": "Москва",
+        "спб": "Санкт-Петербург", "питер": "Санкт-Петербург", "питере": "Санкт-Петербург",
+        "санкт-петербург": "Санкт-Петербург", "санкт петербург": "Санкт-Петербург",
+        "санкт-петербурге": "Санкт-Петербург", "санкт петербурге": "Санкт-Петербург",
+        "петербург": "Санкт-Петербург", "в спб": "Санкт-Петербург", "в питере": "Санкт-Петербург",
+        "казань": "Казань", "в казани": "Казань", "казани": "Казань",
+        "новосибирск": "Новосибирск", "в новосибирске": "Новосибирск", "новосибирске": "Новосибирск",
+        "екатеринбург": "Екатеринбург", "в екатеринбурге": "Екатеринбург", "екатеринбурге": "Екатеринбург", 
+        "нижний новгород": "Нижний Новгород", "в нижнем новгороде": "Нижний Новгород", "нижнем новгороде": "Нижний Новгород",
+        "тверь": "Тверь", "в твери": "Тверь", "твери": "Тверь",
+        "самара": "Самара", "в самаре": "Самара", "самаре": "Самара",
+        "ростов-на-дону": "Ростов-на-Дону", "в ростове-на-дону": "Ростов-на-Дону", "ростове-на-дону": "Ростов-на-Дону",
+        "воронеж": "Воронеж", "в воронеже": "Воронеж", "воронеже": "Воронеж",
+        "пермь": "Пермь", "в перми": "Пермь", "перми": "Пермь",
+        "уфа": "Уфа", "в уфе": "Уфа", "уфе": "Уфа",
+    }
+    if t in specials:
+        return specials[t]
+    # грубая нормализация местного падежа: Москве -> Москва, Твери -> Твери (оставим как есть)
+    if t.endswith("е") and len(t) >= 4:
+        t = t[:-1] + "а"
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    # Тайтл-кейс (для «Нижний новгород» оставим как есть — это упрощёнка)
+    return t.capitalize() if t else ""
+
+def _extract_city(text: str) -> str | None:
+    """Достаём город и возвращаем БЕЗ предлога, нормализованный."""
+    # после предлогов
+    m = re.search(r"(?:^|\s)(?:в|по|из)\s+([А-ЯA-ZЁ][\w\- ]{1,40})", text or "", flags=re.IGNORECASE)
+    if m:
+        cand = re.split(r"[,.!?:;0-9]", m.group(1).strip())[0]
+        norm = _normalize_city_token(cand)
+        return norm or None
+    # явные упоминания
+    low = (text or "").lower()
+    for key in ("москва", "мск", "спб", "санкт-петербург", "санкт петербург", "питер"):
+        if key in low:
+            return _normalize_city_token(key)
+    return None
+
+def _extract_latlon(text: str):
+    m = re.search(r"(-?\d{1,2}\.\d+)[, ]+(-?\d{1,3}\.\d+)", text or "")
+    if m:
+        try:
+            return float(m.group(1)), float(m.group(2))
+        except Exception:
+            return None
+    return None
+
+def _has_any(text: str, words: list[str]) -> bool:
+    t = (text or "").lower()
+    return any(w in t for w in words)
+
+def _extract_formats(text: str) -> list[str]:
+    """
+    Пытаемся понять форматы из свободного текста.
+    Возвращаем токены в том виде, как их ждут фильтры (верхний регистр),
+    чтобы apply_filters мог сравнить по точному равенству.
+    """
+    t = (text or "").lower()
+    fmts = []
+
+    # билборды
+    if any(w in t for w in ("billboard", "билбор", "биллбор", "билборд", "билборды", "биллборд", "биллборды", "bb", "dbb", "бб")):
+        fmts.append("BILLBOARD")
+
+    # суперсайты
+    if any(w in t for w in ("supersite", "суперсайт", "суперсайт", "суперсайты", "ss", "dss")):
+        fmts.append("SUPERSITE")
+
+    # ситиборды 
+    if any(w in t for w in ("cb", "ситик", "ситиборд", "ситиборды", "cityboard", "city board", "dcb", "сити борд", "сити борды", "сити-борд", "сити-борды")):
+        fmts.append("CITY_BOARD")
+
+    # ситиформаты 
+    if any(w in t for w in ("cf", "ситиформат", "ситиформаты", "сити форматы", "сити формат", "сити-формат", "dcf", "сити-форматы")):
+        fmts.append("CITY_FORMAT")    
+
+    # экраны на мцк 
+    if any(w in t for w in ("мцк", "экраны на мцк")):
+        fmts.append("CITY_FORMAT_RC")    
+
+    # экраны в метро 
+    if any(w in t for w in ("экраны в метро", "метро")):
+        fmts.append("CITY_FORMAT_WD")
+
+    # экраны на вокзалах 
+    if any(w in t for w in ("экраны на вокзале", "экраны на вокзалах", "вокзал", "вокзалы")):
+        fmts.append("CITY_FORMAT_RD")
+
+    # медиaфасады / фасады
+    if any(w in t for w in ("медиафасад", "медиафасады", "фасад", "фасады", "mediafacade", "media facade", "фасадов")):
+        fmts.append("MEDIAFACADE")
+    
+    # экраны в помещениях 
+    if any(w in t for w in ("индор", "индорные экраны", "экраны в помещениях", "внутри помещений", "indoor", "в ТЦ", "в тц", "торговый центр", "торговые центры")):
+        fmts.append("OTHER")
+
+    # экраны в аэропортах 
+    if any(w in t for w in ("аэропорты", "экран в аэропорту", "экран в аэропортах", "airport", "airports", "экраны в аэропорту", "экраны в аэропортах")):
+        fmts.append("SKY_DIGITAL")
+
+    # экраны в пвз 
+    if any(w in t for w in ("пвз", "экран в пвз", "экраны в пвз", "экраны в пунктах выдачи", "экран в пункте выдачи", "pickup point", "pickup points", "экран в пункте выдачи заказов", "экраны в пунктах выдачи заказов", "пвз wildberries", "пвз вб", "экран в пвз wildberries", "экраны в пвз wildberries")):
+        fmts.append("PVZ_SCREEN")
+
+
+    # уберём дубликаты, сохраним порядок первого появления
+    seen = set()
+    out = []
+    for f in fmts:
+        if f not in seen:
+            out.append(f); seen.add(f)
+    return out
+
+def _extract_owners(text: str) -> list[str]:
+    t = (text or "")
+    # ловим owner=..., а также «владелец(a/u) <слова>» и «оператор <слова>»
+    m = re.search(r"(?:owner|владелец|владельц[ау]|оператор)\s*[:=]?\s*([A-Za-zА-Яа-я0-9_\-\s,;|]+)", t, flags=re.IGNORECASE)
+    if not m:
+        return []
+    vals = re.split(r"[;,\|]\s*|\s+", m.group(1).strip())
+    vals = [v for v in vals if v and not v.isdigit()]
+    # срежем возможные хвосты после следующего параметра
+    cleaned = []
+    for v in vals:
+        if v.lower() in {"format", "city", "days", "n", "budget", "hours", "hours_per_day"}:
+            break
+        cleaned.append(v)
+    return cleaned
+
+def suggest_command_from_text(text: str) -> tuple[str | None, str]:
+    t = (text or "").strip()
+    low = t.lower()
+
+    # ---------- /plan — планирование под бюджет ----------
+    if _has_any(low, ["план", "спланируй", "на бюджет", "под бюджет", "кампан", "распред", "показы"]):
+        budget = _parse_money(low) or 200_000
+        n = _parse_int(low) or 10
+        m_days = re.search(r"(\d+)\s*дн", low)
+        days = int(m_days.group(1)) if m_days else 10
+        city_raw = _extract_city(t)
+        city = _normalize_city_token(city_raw) if city_raw else "Москва"
+        fmts = _extract_formats(low)
+        owners = _extract_owners(t)
+        top = " top=1" if _has_any(low, ["охватн", "самые охватные", "максимальный охват", "coverage"]) else ""
+        fmt_part = f" format={','.join(sorted(set(fmts)).upper() for fmts in [])}"  # placeholder (see below)
+        # ↑ маленькая хитрость ниже: правильно соберём formats
+        if fmts:
+            fmt_norm = ",".join(s.upper() for s in sorted(set(fmts)))
+            fmt_part = f" format={fmt_norm}"
+        else:
+            fmt_part = ""
+
+        own_part = f" owner={','.join(owners)}" if owners else ""
+        cmd = f"/plan budget={int(budget)} city={city} n={n} days={days}{fmt_part}{own_part}{top}"
+        return cmd, "Планирование кампании под бюджет"
+
+    # ---------- /pick_city — равномерная выборка по городу ----------
+    if _has_any(low, ["подбери", "выбери", "нужно", "хочу"]) and _has_any(low, ["в ", "по ", "из "]):
+        city_raw = _extract_city(t)
+        if city_raw:
+            city = _normalize_city_token(city_raw)
+            n = _parse_int(low) or 20
+            # форматы — только те, что явно упомянуты
+            fmts = _extract_formats(low)
+            fmt_part = f" format={','.join(s.upper() for s in sorted(set(fmts)))}" if fmts else ""
+            # владельцы — из текста после «владелец/владельца/оператор/owner»
+            owners = _extract_owners(t)
+            own_part = f" owner={','.join(owners)}" if owners else ""
+            return f"/pick_city {city} {n}{fmt_part}{own_part}", "Равномерная выборка по городу"
+
+    # ---------- /near — экраны рядом / в радиусе ----------
+    latlon = _extract_latlon(t)
+    if latlon or _has_any(low, ["рядом", "около", "в радиусе", "вокруг", "near", "поблизости"]):
+        if latlon:
+            return f"/near {latlon[0]:.6f} {latlon[1]:.6f} 2", "Экраны в радиусе точки (пример: 2 км)"
+        else:
+            return "📍 Пришлите геолокацию или используйте: /near <lat> <lon> 2", "Экраны вокруг вашей точки"
+
+    # ---------- /forecast — оценка показов для последней выборки ----------
+    if _has_any(low, ["сколько показ", "прогноз", "forecast", "хватит ли", "оценка показов"]):
+        budget = _parse_money(low)
+        if budget:
+            return f"/forecast budget={int(budget)} days=7 hours_per_day=8", "Оценка по последней выборке"
+        else:
+            return "/forecast days=7 hours_per_day=8", "Оценка по последней выборке"
+
+    # ---------- /sync_api — подтянуть инвентарь из API ----------
+    if _has_any(low, ["обнови список", "подтяни из апи", "синхронизируй", "обнови экраны", "sync api"]):
+        fmts = _extract_formats(low)
+        city_raw = _extract_city(t)
+        city = _normalize_city_token(city_raw) if city_raw else None
+        parts = []
+        if city: parts.append(f"city={city}")
+        if fmts: parts.append(f"formats={','.join(s.upper() for s in sorted(set(fmts)))}")
+        base = "/sync_api " + " ".join(parts) if parts else "/sync_api size=500 pages=3"
+        return base.strip(), "Синхронизация инвентаря из API"
+
+    # ---------- /shots — фотоотчёт по кампании ----------
+    if _has_any(low, ["фотоотчет", "фото отчёт", "кадры кампании", "impression", "shots"]):
+        camp = _parse_int(low) or 0
+        if camp > 0:
+            return f"/shots campaign={camp} per=0 limit=100", "Фотоотчёт по кампании"
+        else:
+            return "/shots campaign=<ID> per=0 limit=100", "Фотоотчёт: укажите campaign ID"
+
+    # ---------- /export_last — экспорт ----------
+    if _has_any(low, ["выгрузи", "экспорт", "csv", "xlsx", "таблица"]):
+        return "/export_last", "Экспорт последней выборки"
+
+    # ---------- /radius — изменить радиус ----------
+    if _has_any(low, ["радиус", "поставь радиус", "изменить радиус"]):
+        r = _parse_int(low) or 2
+        return f"/radius {r}", "Задать радиус по умолчанию (км)"
+
+    # ---------- /status /help ----------
+    if _has_any(low, ["статус", "что загружено", "сколько экранов"]):
+        return "/status", "Статус загруженных данных"
+    if _has_any(low, ["help", "помощ", "что умеешь", "команды"]):
+        return "/help", "Справка по командам"
+
+    # Ничего не распознали — мягко отправляем к /help и @enterspring
+    return None, "Похоже, готовой команды для этого нет. Напишите, пожалуйста, @enterspring — она поможет добавить нужную функцию."
+
+# ===== хэндлер =====
+
+@nlu_router.message()
+async def natural_language_assistant(m: types.Message):
+    text = (m.text or "").strip()
+    cmd, hint = suggest_command_from_text(text)
+
+    # глушим странные невидимые символы, чтобы не ломали HTML
+    def _clean(s: str) -> str:
+        return (s or "").replace("\u200b", "").replace("\ufeff", "").strip()
+
+    hint = _clean(hint)
+    cmd  = _clean(cmd) if cmd else None
+
+    # Собираем ответ ТОЛЬКО через hd.*, без «ручных» <b>/<i>/<code>
+    header = "Похоже, сработает это:"
+    parts = [hd.quote(header), ""]  # пустая строка = перенос
+
+    if cmd:
+        # Если это команда — показываем в <code>, иначе просто как текст
+        line = hd.bold("Советую команду") + " 👉 " + (hd.code(cmd) if cmd.startswith("/") else hd.quote(cmd))
+        parts.append(line)
+        if hint:
+            parts += ["", hd.italic(hint)]
+        body = "\n".join(parts)
+    else:
+        # Нет подходящей команды — мягко шлём к /help и @enterspring
+        tail = "А пока можно посмотреть доступные команды: /help"
+        body = hd.quote(hint) + "\n\n" + hd.quote(tail)
+
+    await m.answer(body, parse_mode="HTML", disable_web_page_preview=True)
+
+# Подключение NLU-роутера ДОЛЖНО быть выше, чем основной:
+dp.include_router(nlu_router)
 
 async def main():
     try:
