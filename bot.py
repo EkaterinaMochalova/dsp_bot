@@ -7042,113 +7042,122 @@ async def cmd_examples(m: types.Message):
 
 
 @dp.message(Command("sync_api"))
-async def cmd_sync_api(m: types.Message, _call_args: dict | None = None):
-    """
-    Синхронизация инвентаря из API.
-    Поддерживает:
-      /sync_api city=Воронеж limit=40
-      /sync_api formats=MEDIA_FACADE,BILLBOARD owner="MAER;RussOutdoor" limit=500
-    Также может вызываться из /ask через _call_args.
-    """
-    global SCREENS, LAST_SYNC_TS
+async def cmd_sync_api(m: types.Message):
+    if not _owner_only(m.from_user.id):
+        await m.answer("⛔️ Только владелец бота может выполнять эту команду.")
+        return
 
-    def _as_list(v):
-        if v is None:
-            return []
-        if isinstance(v, list):
-            return [str(x).strip() for x in v if str(x).strip()]
-        return [s.strip() for s in str(v).replace(";", ",").replace("|", ",").split(",") if s.strip()]
+    # --- парсим опции ---
+    text = (m.text or "").strip()
+    parts = text.split()[1:]
 
-    def _norm_formats(lst):
-        return [s.upper().replace(" ", "_") for s in _as_list(lst)]
-
-    # ---- разбор параметров ----
-    if _call_args is None:
-        # key=value из текста
-        parts = (m.text or "").strip().split()[1:]
-        kv = {}
+    def _get_opt(name, cast, default):
         for p in parts:
-            if "=" in p:
-                k, v = p.split("=", 1)
-                kv[k.strip().lower()] = v.strip().strip('"').strip("'")
-        city    = (kv.get("city") or kv.get("город") or "").strip()
-        formats = _norm_formats(kv.get("format") or kv.get("formats"))
-        owners  = _as_list(kv.get("owner") or kv.get("owners"))
-        try:
-            limit = int(float(kv.get("limit"))) if kv.get("limit") is not None else None
-        except Exception:
-            limit = None
-    else:
-        args    = dict(_call_args)
-        city    = (args.get("city") or "").strip()
-        formats = _norm_formats(args.get("formats"))
-        owners  = _as_list(args.get("owners"))
-        limit   = None
-        if args.get("limit") is not None:
-            try:
-                limit = int(float(args["limit"]))
-            except Exception:
-                limit = None
+            if p.startswith(name + "="):
+                val = p.split("=", 1)[1]
+                try:
+                    return cast(val)
+                except:
+                    return default
+        return default
 
-    # ---- инфо для пользователя ----
-    pieces = []
-    if city:    pieces.append(f'city="{city}"')
-    if formats: pieces.append("formats=" + ",".join(formats))
-    if owners:  pieces.append("owners=" + ",".join(owners))
-    if limit:   pieces.append(f"limit={limit}")
-    await m.answer("⏳ Синхронизирую инвентарь…" + (" (" + ", ".join(pieces) + ")" if pieces else ""))
+    def _as_list(s):
+        return [x.strip() for x in str(s).split(",") if x.strip()] if s else []
 
-    # ---- вызов твоей функции, которая реально тянет данные из DSP ----
+    pages_limit = _get_opt("pages", int, None)
+    page_size   = _get_opt("size", int, 500)
+    total_limit = _get_opt("limit", int, None)
+
+    # фильтры высокого уровня
+    city     = _get_opt("city", str, "").strip()
+    formats  = _as_list(_get_opt("formats", str, "") or _get_opt("format", str, ""))
+    owners   = _as_list(_get_opt("owners", str, "")  or _get_opt("owner", str, ""))
+
+    # любые доп. api.* -> прямо в query
+    raw_api = {}
+    for p in parts:
+        if p.startswith("api.") and "=" in p:
+            k, v = p.split("=", 1)
+            raw_api[k[4:]] = v
+
+    filters = {
+        "city": city,
+        "formats": formats,
+        "owners": owners,
+        "api_params": raw_api,
+    }
+
+    pretty = []
+    if city:    pretty.append(f"city={city}")
+    if formats: pretty.append(f"formats={','.join(formats)}")
+    if owners:  pretty.append(f"owners={','.join(owners)}")
+    if raw_api: pretty.append("+" + "&".join(f"{k}={v}" for k, v in raw_api.items()))
+    hint = (" (фильтры: " + ", ".join(pretty) + ")") if pretty else ""
+    await m.answer("⏳ Тяну инвентарь из внешнего API…" + hint)
+
+    # --- тянем, нормализуем, сохраняем ---
     try:
-        # ⚠️ ЗАМЕНИ на твою фактическую функцию загрузки.
-        # Она должна вернуть pandas.DataFrame с колонками минимум: lat, lon, screen_id (желательно ещё format, owner, city)
-        df = await _sync_api_pull(city=city or None, formats=formats or None, owners=owners or None)
+        items = await _fetch_inventories(
+            pages_limit=pages_limit,
+            page_size=page_size,
+            total_limit=total_limit,
+            m=m,
+            filters=filters,   # ВАЖНО: фильтры уедут прямо в запрос
+        )
     except Exception as e:
-        await m.answer(f"🚫 Ошибка синхронизации: {e}")
+        logging.exception("sync_api failed")
+        await m.answer(f"🚫 Не удалось синкнуть: {e}")
         return
 
-    if df is None or df.empty:
-        await m.answer("Пустой ответ: инвентарь не найден по заданным фильтрам.")
+    if not items:
+        await m.answer("API вернул пустой список.")
         return
 
-    # применяем limit, если просили
-    if isinstance(limit, int) and limit > 0 and len(df) > limit:
-        df = df.head(limit).copy()
+    # нормализация -> DataFrame
+    df = _normalize_api_to_df(items)   # <--- правильное имя функции
+    if df.empty:
+        await m.answer("Список пришёл, но после нормализации пусто (проверь маппинг полей).")
+        return
 
-    # нормализация базовых колонок
-    for need in ("lat", "lon"):
-        if need not in df.columns:
-            # попробуем найти регистронезависимо
-            cand = next((c for c in df.columns if str(c).lower() == need), None)
-            if cand:
-                df = df.rename(columns={cand: need})
-    # приведение типов
-    try:
-        df["lat"] = df["lat"].astype(float)
-        df["lon"] = df["lon"].astype(float)
-    except Exception:
-        pass
+    # в память
+    global SCREENS
+    SCREENS = df
 
-    # обновляем глобальный кэш
-    SCREENS = df.reset_index(drop=True)
+    # сохранить кэш на диск
     try:
-        from datetime import datetime
-        LAST_SYNC_TS = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        LAST_SYNC_TS = "now"
+        if save_screens_cache(df):
+            await m.answer(f"💾 Кэш сохранён на диск: {len(df)} строк.")
+        else:
+            await m.answer("⚠️ Не удалось сохранить кэш на диск.")
+    except Exception as e:
+        await m.answer(f"⚠️ Ошибка при сохранении кэша: {e}")
 
-    # ответ коротко + CSV
+    # --- отправка CSV ---
     try:
-        import io as _io
-        csv_bytes = SCREENS.to_csv(index=False).encode("utf-8-sig")
+        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
         await bot.send_document(
             m.chat.id,
-            BufferedInputFile(csv_bytes, filename="screens_synced.csv"),
-            caption=f"✅ Инвентарь обновлён: {len(SCREENS)} строк" + (f" (limit={limit})" if limit else "")
+            BufferedInputFile(csv_bytes, filename="inventories_sync.csv"),
+            caption=f"Инвентарь из API: {len(df)} строк (CSV)"
         )
-    except Exception:
-        await m.answer(f"✅ Инвентарь обновлён: {len(SCREENS)} строк" + (f" (limit={limit})" if limit else ""))
+    except Exception as e:
+        await m.answer(f"⚠️ Не удалось отправить CSV: {e}")
 
+    # --- отправка XLSX ---
+    try:
+        xlsx_buf = io.BytesIO()
+        with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="inventories")
+        xlsx_buf.seek(0)
+        await bot.send_document(
+            m.chat.id,
+            BufferedInputFile(xlsx_buf.getvalue(), filename="inventories_sync.xlsx"),
+            caption=f"Инвентарь из API: {len(df)} строк (XLSX)"
+        )
+    except Exception as e:
+        await m.answer(f"⚠️ Не удалось отправить XLSX: {e} (проверь, установлен ли openpyxl)")
+
+    await m.answer(f"✅ Синхронизация ок: {len(df)} экранов.")
 
 # === ФУНКЦИЯ ПОДТЯГИВАНИЯ ДАННЫХ ИЗ API ===
 import aiohttp
