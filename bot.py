@@ -57,42 +57,56 @@ LAST_SYNC_TS: float | None = None
 # Гео-настройки
 DEFAULT_RADIUS: float = 2.0
 USER_RADIUS: dict[int, float] = {}
+PLAN_MAX_PLAYS_PER_HOUR = 40  # лимит показов в час для планирования
 
 # ====== Меню и help ======
 HELP = (
-    "👋 Привет. Я подбираю рекламные экраны.\n\n"
-    "📄 Сначала пришлите файл CSV/XLSX с колонками минимум: lat, lon.\n"
-    "   Дополнительно поддерживаются: screen_id, name, city, format, owner.\n\n"
+    "👋 Привет! Я помогаю подбирать рекламные экраны и планировать показы.\n\n"
+    "📄 Сначала пришлите файл CSV/XLSX c колонками минимум: lat, lon.\n"
+    "   Дополнительно поддерживаются: screen_id, name, city, format, owner, minBid / min_bid.\n\n"
+
     "🔎 Основные команды:\n"
     "• /status — что загружено и сколько экранов\n"
     "• /radius 2 — задать радиус по умолчанию (км)\n"
+    "• /cache_info — диагностика локального кэша\n"
+    "• /sync_api [фильтры] — подтянуть инвентарь из API (если настроены переменные окружения)\n"
     "• /near <lat> <lon> [R] [filters] [fields=...] — экраны в радиусе\n"
-    "   Примеры:\n"
-    "   /near 55.714349 37.553834 2\n"
-    "   /near 55.714349 37.553834 2 fields=screen_id\n"
-    "   /near 55.714349 37.553834 2 format=city\n"
-    "   /near 55.714349 37.553834 2 format=billboard,supersite\n\n"
     "• /pick_city <Город> <N> [filters] [mix=...] [fields=...] — равномерная выборка по городу\n"
-    "   Примеры:\n"
-    "   /pick_city Москва 20\n"
-    "   /pick_city Москва 20 fields=screen_id\n"
-    "   /pick_city Москва 20 format=city fields=screen_id\n"
-    "   /pick_city Москва 20 format=billboard,supersite mix=billboard:70%,supersite:30% fields=screen_id\n\n"
-    "• /shots campaign=<ID> [per=0] [limit=100] [zip=1] [fields=...] — фотоотчёты по кампании.\n"
-    "   per — ограничение кадров на (экран×креатив); zip=1 — приложить ZIP с фото.\n\n"
-    "   Опции случайности: shuffle=1 | fixed=1 | seed=42\n\n"
     "• /pick_at <lat> <lon> <N> [R] — равномерная выборка в круге\n"
-    "   Пример: /pick_at 55.75 37.62 25 15\n\n"
-    "• /forecast [budget=...] [days=7] [hours_per_day=8] [hours=07-10,17-21]\n"
-    "• /export_last — выгрузить последнюю выборку (CSV)\n"
-    "• Отправьте геолокацию 📍 — найду экраны вокруг точки с радиусом по умолчанию\n\n"
+    "• /forecast [budget=...] [days=7] [hours_per_day=8] [hours=07-10,17-21] — прикинуть показы и стоимость по последней выборке\n"
+    "• /plan budget=<сумма> [city=...] [format=...] [owner=...] [n=...] [days=...] [hours_per_day=...] [top=1] — спланировать кампанию под бюджет\n"
+    "• /export_last — выгрузить последнюю выборку (CSV)\n\n"
+
+    "🧠 Подсказки и примеры:\n"
+    "• /sync_api city=Москва formats=billboard,supersite size=500 pages=3 — подтянуть экраны из API\n"
+    "• /near 55.714349 37.553834 2 — всё в радиусе 2 км\n"
+    "• /near 55.714349 37.553834 2 fields=screen_id — только GID’ы\n"
+    "• /near 55.714349 37.553834 2 format=city — только «гиды» (CITY_FORMAT_*)\n"
+    "• /near 55.714349 37.553834 2 format=billboard,supersite — несколько форматов\n\n"
+
+    "• /pick_city Москва 20 — равномерно 20 экранов по городу\n"
+    "• /pick_city Москва 20 fields=screen_id — только GID’ы\n"
+    "• /pick_city Москва 20 format=city fields=screen_id — только «гиды»\n"
+    "• /pick_city Москва 20 format=billboard,supersite mix=billboard:70%,supersite:30% — с квотами форматов\n\n"
+
+    "• /pick_at 55.75 37.62 25 15 — равномерно 25 экранов в круге R=15 км\n\n"
+
+    "• /forecast budget=500000 days=7 hours_per_day=8 — оценка по последней выборке\n"
+    "• /forecast hours=07-10,17-21 — задаёт «окна» показа; часы/день считаются из окон\n\n"
+
+    "• /plan budget=200000 city=Москва n=10 days=10 hours_per_day=8 — равномерно выбрать 10 экранов и рассчитать слоты\n"
+    "• /plan budget=200000 city=Москва n=10 days=10 top=1 — выбрать самые охватные (по OTS)\n"
+    "• /plan budget=1.5m city=СПб format=billboard,supersite n=30 days=14 hours_per_day=6 — с приоритетом заданных форматов\n\n"
+
     "🔤 Фильтры:\n"
-    "   format=city — все CITY_FORMAT_* (алиас «гиды»)\n"
-    "   format=A,B | A;B | A|B — несколько форматов\n"
-    "   owner=russ | owner=russ,gallery — по владельцу (подстрока, нечувств. к регистру)\n"
-    "   fields=screen_id | screen_id,format — какие поля выводить\n\n"
-    "🧩 Пропорции (квоты) форматов в /pick_city:\n"
-    "   mix=BILLBOARD:60%,CITY:40%  или  mix=CITY_FORMAT_RC:5,CITY_FORMAT_WD:15\n"
+    "   • format=city — все CITY_FORMAT_* (алиас «гиды»)\n"
+    "   • format=A,B | A;B | A|B — несколько форматов\n"
+    "   • owner=russ | owner=russ,gallery — фильтр по владельцу (подстрока, без учёта регистра)\n"
+    "   • fields=screen_id | screen_id,format — какие поля выводить\n\n"
+
+    "📦 Экспорт: команды присылают CSV/XLSX там, где это уместно.\n"
+    "⚙️ Планирование: считаем дневной бюджет на экран, делим на minBid, "
+    "ограничиваем по техническому лимиту (max 40 выходов/час).\n"
 )
 
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
@@ -101,11 +115,12 @@ def make_main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="/help"), KeyboardButton(text="/status")],
+            [KeyboardButton(text="/plan budget=200000 city=Москва n=10 days=10 hours_per_day=8")],
+            [KeyboardButton(text="/near 55.714349 37.553834 2"), KeyboardButton(text="/pick_city Москва 20")],
             [KeyboardButton(text="/export_last"), KeyboardButton(text="/radius 2")],
-            [KeyboardButton(text="📍 Отправить геолокацию")],
         ],
         resize_keyboard=True,
-        input_field_placeholder="Например: /near <lat> <lon> 2  или  пришлите файл CSV/XLSX"
+        input_field_placeholder="Например: /plan budget=200000 city=Москва n=10 days=10 hours_per_day=8"
     )
 
 # ====== Кэш-инфраструктура ======
@@ -1173,6 +1188,192 @@ async def cmd_forecast(m: types.Message):
     except Exception as e:
         await m.answer(f"⚠️ Не удалось отправить XLSX: {e}")
 
+# ---------- PLAN (бюджет → подбор экранов и план показов) ----------
+def _as_list_any(sep_str: str | None) -> list[str]:
+    if not sep_str:
+        return []
+    s = sep_str.replace(";", ",").replace("|", ",")
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+def _priority_mask_by_formats(df: pd.DataFrame, tokens: list[str]) -> pd.DataFrame:
+    """Оставить в df только строки, у которых format попадает в tokens (учёт CITY алиасов)."""
+    if "format" not in df.columns or not tokens:
+        return df.copy()
+    col = df["format"].astype(str).str.upper()
+    mask = None
+    for tok in tokens:
+        if tok.lower() in {"city","city_format","cityformat","citylight","гид","гиды"}:
+            m = col.str.startswith("CITY_FORMAT")
+        else:
+            m = (col == tok.upper())
+        mask = m if mask is None else (mask | m)
+    return df[mask].copy()
+
+def _prefer_formats(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    """Если формат не задан пользователем: сначала BILLBOARD, потом SUPERSITE, потом CITY_FORMAT*, затем остальное.
+       Возвращает пул из не более n*3-4 строк (чтобы было из чего равномерно выбирать)."""
+    if "format" not in df.columns or df.empty:
+        return df
+    wanted = []
+    # 1) BILLBOARD
+    bb = df[df["format"].astype(str).str.upper().eq("BILLBOARD")]
+    wanted.append(bb)
+    # 2) SUPERSITE
+    ss = df[df["format"].astype(str).str.upper().eq("SUPERSITE")]
+    wanted.append(ss)
+    # 3) CITY_*
+    cc = df[df["format"].astype(str).str.upper().str.startswith("CITY_FORMAT")]
+    wanted.append(cc)
+    # 4) Остальное
+    other = df[~df.index.isin(pd.concat(wanted, ignore_index=False).index)]
+    wanted.append(other)
+    # склеим, но чуть ограничим размер, чтобы spread_select работал шустрее
+    pool = pd.concat(wanted, ignore_index=True)
+    return pool.head(max(n * 5, n))  # небольшой запас
+
+@router.message(Command("plan"))
+async def cmd_plan(m: types.Message):
+    global SCREENS
+    if SCREENS is None or SCREENS.empty:
+        await m.answer("Сначала загрузите инвентарь (CSV/XLSX) или выполните /sync_api.")
+        return
+
+    # ---- парсинг параметров ----
+    parts = (m.text or "").strip().split()[1:]
+    kv: dict[str,str] = {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            kv[k.strip().lower()] = v.strip()
+
+    # бюджет (обяз.)
+    budget_raw = kv.get("budget") or kv.get("b")
+    if not budget_raw:
+        await m.answer("Нужно указать бюджет: /plan budget=200000 [city=...] [format=...] [owner=...] [n=10] [days=10] [hours_per_day=8] [top=1]")
+        return
+    try:
+        v = budget_raw.lower().replace(" ", "")
+        if v.endswith("m"):
+            budget_total = float(v[:-1]) * 1_000_000
+        elif v.endswith("k"):
+            budget_total = float(v[:-1]) * 1_000
+        else:
+            budget_total = float(v)
+    except Exception:
+        await m.answer("Не понял бюджет. Пример: budget=200000 или budget=200k")
+        return
+
+    # опциональные
+    city   = kv.get("city")
+    n      = int(kv["n"]) if kv.get("n","").isdigit() else 10
+    days   = int(kv["days"]) if kv.get("days","").isdigit() else 10
+    # часы: либо hours_per_day=8, либо windows hours=07-10,17-21
+    hours_per_day = int(kv["hours_per_day"]) if kv.get("hours_per_day","").isdigit() else None
+    if hours_per_day is None:
+        win = _parse_hours_windows(kv.get("hours"))
+        hours_per_day = win if (win is not None) else 8
+
+    formats = _as_list_any(kv.get("format") or kv.get("formats"))
+    owners  = _as_list_any(kv.get("owner")  or kv.get("owners"))
+    want_top = str(kv.get("top","0")).lower() in {"1","true","yes","on"} or \
+               str(kv.get("coverage","0")).lower() in {"1","true","yes","on"}
+
+    # ---- формируем пул ----
+    pool = SCREENS.copy()
+    # city
+    if city and "city" in pool.columns:
+        pool = pool[pool["city"].astype(str).str.strip().str.lower() == city.strip().lower()]
+    if pool.empty:
+        await m.answer("По заданному городу нет экранов (с учётом вводных).")
+        return
+    # filters (format/owner)
+    if formats:
+        pool = _priority_mask_by_formats(pool, formats)
+    if owners:
+        pool = apply_filters(pool, {"owner": ",".join(owners)})
+    if pool.empty:
+        await m.answer("После применения фильтров экранов не осталось.")
+        return
+
+    # minBid обогащение
+    pool = _fill_min_bid(pool)
+
+    # если формат не указан — отдаём приоритет BB→SUPERSITE→CITY→остальные
+    if not formats:
+        pool = _prefer_formats(pool, n)
+
+    # ---- выбор экранов: top по OTS или равномерно ----
+    if want_top and "ots" in pool.columns:
+        # берём топ по OTS (если несколько городов — в рамках текущего city)
+        # если OTS пусты — fallback к равномерному
+        try:
+            ots_vals = pd.to_numeric(pool["ots"], errors="coerce")
+            if ots_vals.dropna().empty:
+                raise ValueError("empty ots")
+            pool = pool.assign(_ots=ots_vals).sort_values("_ots", ascending=False)
+            selected = pool.head(n).drop(columns=["_ots"])
+        except Exception:
+            selected = spread_select(pool.reset_index(drop=True), n, random_start=True, seed=None)
+    else:
+        selected = spread_select(pool.reset_index(drop=True), n, random_start=True, seed=None)
+
+    if selected.empty:
+        await m.answer("Не удалось выбрать экраны (слишком строгие ограничения?).")
+        return
+
+    # ---- расчёт планов ----
+    # бюджет/день/экран
+    budget_per_day_per_screen = budget_total / max(n, 1) / max(days, 1)
+
+    # флаг ставки
+    mb = pd.to_numeric(selected["min_bid_used"], errors="coerce")
+    # подставим медиану, если у кого-то NaN
+    median_mb = float(mb.dropna().median()) if not mb.dropna().empty else 0.0
+    mb = mb.fillna(median_mb)
+
+    # максимальные слоты в день по техническому лимиту
+    per_day_cap = hours_per_day * PLAN_MAX_PLAYS_PER_HOUR
+
+    # расчёт слотов/день и итогов
+    slots_per_day = (budget_per_day_per_screen // mb).astype(int)
+    slots_per_day = slots_per_day.clip(lower=0, upper=per_day_cap)
+    total_slots = slots_per_day * days
+    planned_cost = total_slots * mb
+
+    out = selected.copy()
+    out["budget_per_day"] = round(budget_per_day_per_screen, 2)
+    out["min_bid_used"] = mb
+    out["planned_slots_per_day"] = slots_per_day
+    out["total_slots"] = total_slots
+    out["planned_cost"] = planned_cost
+
+    # ---- экспорт ----
+    try:
+        csv_bytes = out.to_csv(index=False).encode("utf-8-sig")
+        await m.bot.send_document(
+            m.chat.id,
+            BufferedInputFile(csv_bytes, filename="plan.csv"),
+            caption=(
+                f"План: бюджет={budget_total:,.0f} ₽, n={n}, days={days}, "
+                f"hours/day={hours_per_day}, cap={PLAN_MAX_PLAYS_PER_HOUR}/час"
+            ).replace(",", " ")
+        )
+    except Exception as e:
+        await m.answer(f"⚠️ Не удалось отправить CSV: {e}")
+
+    try:
+        xbuf = io.BytesIO()
+        with pd.ExcelWriter(xbuf, engine="openpyxl") as w:
+            out.to_excel(w, index=False, sheet_name="plan")
+        xbuf.seek(0)
+        await m.bot.send_document(
+            m.chat.id,
+            BufferedInputFile(xbuf.getvalue(), filename="plan.xlsx"),
+            caption="План (XLSX)"
+        )
+    except Exception as e:
+        await m.answer(f"⚠️ Не удалось отправить XLSX: {e}")
+
 # ---------- Радиус, Near ----------
 @router.message(Command("radius"))
 async def set_radius(m: types.Message):
@@ -1582,6 +1783,7 @@ async def main():
         BotCommand(command="pick_at", description="Равномерная выборка в круге"),
         BotCommand(command="export_last", description="Экспорт последней выборки"),
         BotCommand(command="help", description="Справка"),
+        BotCommand(command="plan", description="План показа: бюджет → экраны → слоты"),
     ])
 
     await bot.delete_webhook(drop_pending_updates=True)
