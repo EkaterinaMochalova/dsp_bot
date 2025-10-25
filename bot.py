@@ -65,6 +65,16 @@ GOOGLE_PLACES_KEY = os.getenv("GOOGLE_PLACES_KEY") or ""   # если захоч
 YANDEX_API_KEY    = os.getenv("YANDEX_API_KEY") or ""      # если захочешь Яндекс
 D2GIS_API_KEY     = os.getenv("D2GIS_API_KEY") or ""       # если захочешь 2ГИС
 
+# --- Geo providers ---
+import aiohttp, asyncio, json
+
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+]
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search
+
 # последнее найденное множество POI (для /near_geo без текста)
 LAST_POI: list[dict] = []
 
@@ -85,26 +95,27 @@ HELP = (
     "• /radius 2 — задать радиус по умолчанию (км)\n"
     "• /cache_info — диагностика локального кэша\n"
     "• /sync_api [фильтры] — подтянуть инвентарь из API (если настроены переменные окружения)\n"
-    "• /sync_api city=Москва formats=billboard,supersite size=500 pages=3 — подтянуть экраны из API\n"
+    "Например: /sync_api city=Москва — подтянуть экраны из API только по Москве\n"
     "• /export_last — выгрузить последнюю выборку (CSV)\n\n"
     
     "🔎 Выбрать экраны:\n"
     "• /near <lat> <lon> [R] [filters] [fields=...] — экраны в радиусе\n"
-    "• /near 55.714349 37.553834 2 — всё в радиусе 2 км\n"
+    "Например: /near 55.714349 37.553834 2 — всё в радиусе 2 км\n"
     "• /pick_city <Город> <N> [filters] [mix=...] [fields=...] — равномерная выборка по городу\n"
-    "• /pick_city Москва 20 format=billboard,supersite — несколько форматов\n"
+    "Например: /pick_city Москва 20 format=billboard,supersite — 20 ББ и СС в Москве равномерно\n"
     "• /pick_at <lat> <lon> <N> [R] — равномерная выборка в круге\n\n"
 
     "📊 Прогнозы и планы:\n"
     "• /forecast [budget=...] [days=7] [hours_per_day=8] [hours=07-10,17-21]\n"
+    "Например: /forecast days=14 hours_per_day=10 — прогноз по бюджету на 14 дней\n"
     "• /plan budget=<сумма> [city=...] [format=...] [owner=...] [n=...] [days=...] [hours_per_day=...] [top=1] — спланировать кампанию под бюджет\n"
-    "• /plan budget=200000 city=Москва n=10 days=10 hours_per_day=8 — равномерно выбрать 10 экранов и рассчитать слоты\n\n"
+    "Например: /plan budget=200000 city=Москва n=10 days=10 hours_per_day=8 — равномерно выбрать 10 экранов и рассчитать слоты\n\n"
 
     "🧭 Поиск точек на карте и подбор рядом:\n"
     "• /geo <запрос> [city=...] [limit=5] — найти координаты по запросу\n"
     "   Примеры:\n"
     "   /geo Твой дом city=Москва\n"
-    "   /geo новостройки бизнес-класса city=Воронеж limit=10\n"
+    "   /geo Burger King city=Москва limit=15"
     "• /near_geo [R] [fields=...] — подобрать экраны вокруг найденных точек\n"
     "   Примеры:\n"
     "   /near_geo 2\n"
@@ -206,6 +217,198 @@ def load_screens_cache() -> bool:
         return False
 
 # ====== Гео и вспомогательные утилиты ======
+
+# Лёгкая классификация по ключевым словам -> OSM теги
+_OSM_CATEGORY_HINTS = [
+    # (ключ-значение, список ключевых слов)
+    (("amenity", "pharmacy"), ["аптека", "pharmacy"]),
+    (("shop", "mall"), ["тц", "торговый центр", "молл", "mall"]),
+    (("shop", "doityourself"), ["твой дом", "leroy", "obi", "castorama"]),
+    (("amenity", "hospital"), ["больница", "hospital"]),
+    (("amenity", "university"), ["университет", "university"]),
+    (("amenity", "school"), ["школа", "school"]),
+    (("amenity", "cinema"), ["кинотеатр", "cinema"]),
+    (("amenity", "parking"), ["парковка", "parking"]),
+]
+def _detect_osm_category(q: str):
+    t = (q or "").lower()
+    for (k, v), words in _OSM_CATEGORY_HINTS:
+        if any(w in t for w in words):
+            return k, v
+    return None
+
+async def _nominatim_city_bbox(session: aiohttp.ClientSession, city: str, ssl):
+    """Получаем bbox города через Nominatim: (south, west, north, east)."""
+    params = {
+        "q": city,
+        "format": "jsonv2",
+        "limit": 1,
+        "addressdetails": 0,
+        "polygon_geojson": 0,
+    }
+    headers = {"User-Agent": "omniboard-bot/1.0"}
+    async with session.get(NOMINATIM_URL, params=params, headers=headers, ssl=ssl) as r:
+        data = await r.json()
+    if not data:
+        return None
+    bbox = data[0].get("boundingbox")
+    if not bbox or len(bbox) < 4:
+        return None
+    south, north, west, east = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+    # Nominatim отдаёт [south, north, west, east]
+    return (south, west, north, east)
+
+def _build_overpass_query(q: str, bbox=None, limit=50):
+    """
+    Строим Overpass QL.
+    Если распознали категорию — добавим (k=v).
+    Имя ищем по regexp /name~/…/i (безопасная очистка).
+    """
+    # Регекс по имени (вырежем лишнее, экранируем точку в "36.6")
+    name_tokens = [t for t in re.split(r"\s+", q.strip()) if t]
+    pattern = "|".join([re.escape(t).replace(r"\.", r"\.") for t in name_tokens])  # "36.6" -> "36\.6"
+    name_clause = f'[name~"{pattern}",i]'
+
+    kv = _detect_osm_category(q)  # например ("amenity","pharmacy")
+    kv_clause = ""
+    if kv:
+        kv_clause = f'[{kv[0]}="{kv[1]}"]'
+
+    bbox_clause = ""
+    if bbox and len(bbox) == 4:
+        s, w, n, e = bbox
+        bbox_clause = f"({s},{w},{n},{e})"
+
+    # Ищем по всем типам: точки, пути, отношения; для ways/relations берём center
+    ql = f"""
+[out:json][timeout:25];
+(
+  node{kv_clause}{name_clause}{bbox_clause};
+  way{kv_clause}{name_clause}{bbox_clause};
+  relation{kv_clause}{name_clause}{bbox_clause};
+);
+out center {limit};
+"""
+    return ql
+
+async def _overpass_search(session: aiohttp.ClientSession, query: str, city: str | None, limit: int, ssl):
+    # Получим bbox города для сужения (если задан city)
+    bbox = None
+    if city:
+        try:
+            bbox = await _nominatim_city_bbox(session, city, ssl)
+        except Exception:
+            bbox = None
+
+    ql = _build_overpass_query(query, bbox=bbox, limit=limit)
+    headers = {"User-Agent": "omniboard-bot/1.0"}
+    for url in OVERPASS_ENDPOINTS:
+        try:
+            async with session.post(url, data=ql.encode("utf-8"), headers=headers, ssl=ssl, timeout=aiohttp.ClientTimeout(total=40)) as r:
+                if r.status != 200:
+                    continue
+                data = await r.json()
+        except Exception:
+            continue
+
+        els = data.get("elements", []) if isinstance(data, dict) else []
+        pois = []
+        seen = set()
+        for el in els:
+            tags = el.get("tags", {}) or {}
+            name = tags.get("name") or tags.get("brand") or "(без названия)"
+            lat = el.get("lat")
+            lon = el.get("lon")
+            if lat is None or lon is None:
+                center = el.get("center") or {}
+                lat = center.get("lat")
+                lon = center.get("lon")
+            if lat is None or lon is None:
+                continue
+            key = (round(float(lat), 6), round(float(lon), 6), name)
+            if key in seen:
+                continue
+            seen.add(key)
+            pois.append({
+                "name": name,
+                "lat": float(lat),
+                "lon": float(lon),
+                "provider": "overpass",
+                "raw": {"id": el.get("id"), "type": el.get("type"), "tags": tags}
+            })
+        if pois:
+            # отсортируем по имени для стабильности
+            pois.sort(key=lambda x: x["name"].lower())
+            return pois[:limit]
+    return []
+
+async def _nominatim_search(session: aiohttp.ClientSession, query: str, city: str | None, limit: int, ssl):
+    q = f"{query}, {city}" if city else query
+    params = {
+        "q": q,
+        "format": "jsonv2",
+        "limit": limit,
+        "addressdetails": 0,
+    }
+    headers = {"User-Agent": "omniboard-bot/1.0"}
+    async with session.get(NOMINATIM_URL, params=params, headers=headers, ssl=ssl, timeout=aiohttp.ClientTimeout(total=30)) as r:
+        data = await r.json()
+
+    pois = []
+    seen = set()
+    for item in data or []:
+        name = item.get("display_name") or "(без названия)"
+        lat = item.get("lat")
+        lon = item.get("lon")
+        if not lat or not lon:
+            continue
+        key = (round(float(lat), 6), round(float(lon), 6), name)
+        if key in seen:
+            continue
+        seen.add(key)
+        pois.append({
+            "name": name,
+            "lat": float(lat),
+            "lon": float(lon),
+            "provider": "nominatim"
+        })
+    return pois[:limit]
+
+def _make_ssl_param_for_aiohttp():
+    # у тебя уже есть эта функция; оставляю заглушку чтобы не ронять импорт
+    import ssl, os
+    verify = (os.getenv("OBDSP_SSL_VERIFY","1") or "1").lower() in {"1","true","yes","on"}
+    if verify:
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+async def geocode_query(query: str, city: str | None = None, limit: int = 10, provider: str = "nominatim"):
+    """
+    Возвращает список POI: [{name, lat, lon, provider, raw?}]
+    provider: 'nominatim' | 'overpass'
+    """
+    ssl_param = _make_ssl_param_for_aiohttp()
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
+        prov = (provider or "nominatim").lower().strip()
+        if prov == "overpass":
+            pois = await _overpass_search(session, query, city, limit, ssl_param)
+            if pois:
+                return pois
+            # если пусто — фолбэк на nominatim
+            return await _nominatim_search(session, query, city, limit, ssl_param)
+        else:
+            pois = await _nominatim_search(session, query, city, limit, ssl_param)
+            # если «сетевой» запрос (много результатов ожидается), а nominatim дал 0–1 — попробуем Overpass
+            expect_many = any(w in (query or "").lower() for w in ["аптека", "тц", "торговый центр", "36.6", "твой дом"])
+            if (not pois or len(pois) < 2) and expect_many:
+                more = await _overpass_search(session, query, city, limit, ssl_param)
+                if more:
+                    return more
+            return pois
+
 def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
     lat1, lon1 = map(math.radians, a)
     lat2, lon2 = map(math.radians, b)
