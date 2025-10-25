@@ -13,11 +13,24 @@ except Exception:
 from datetime import datetime
 import io
 from aiogram.types import BufferedInputFile
-
-
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile  # для отправки файлов из памяти
+from aiogram import types
+from aiogram.filters import Command
+
+async def cache_info_handler(m: types.Message):
+    try:
+        lines = [
+            f"CACHE_DIR: {CACHE_DIR}",
+            f"exists: {CACHE_DIR.exists()}",
+            f"writable: {os.access(CACHE_DIR, os.W_OK)}",
+            f"CACHE_CSV exists: {CACHE_CSV.exists()}",
+            f"CACHE_META exists: {CACHE_META.exists()}",
+        ]
+        await m.answer("\n".join(lines))
+    except Exception as e:
+        await m.answer(f"cache_info error: {e}")
 
 # ==== КЭШ ИНВЕНТАРЯ: максимально надёжный вариант через /tmp ====
 import os, json, time, logging
@@ -179,12 +192,15 @@ if not BOT_TOKEN:
     raise SystemExit("Set BOT_TOKEN env var first")
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+dp.message.register(cache_info_handler, Command("cache_info"))
 
 from aiogram.filters import Command
 from aiogram import types
 
-@dp.message(Command("cache_info"))
-async def cache_info(m: types.Message):
+from aiogram import types
+from aiogram.filters import Command
+
+async def cache_info_handler(m: types.Message):
     try:
         lines = [
             f"CACHE_DIR: {CACHE_DIR}",
@@ -196,12 +212,6 @@ async def cache_info(m: types.Message):
         await m.answer("\n".join(lines))
     except Exception as e:
         await m.answer(f"cache_info error: {e}")
-
-# ====== ХРАНИЛИЩЕ (MVP) ======
-SCREENS: pd.DataFrame | None = None
-USER_RADIUS: dict[int, float] = {}
-DEFAULT_RADIUS = 1.0
-LAST_RESULT: pd.DataFrame | None = None
 
 HELP = (
     "👋 Привет. Я подбираю рекламные экраны.\n\n"
