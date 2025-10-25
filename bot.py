@@ -906,50 +906,52 @@ def suggest_command_from_text(text: str) -> tuple[str | None, str]:
     t = (text or "").strip()
     low = t.lower()
 
-    # /plan — планирование под бюджет
+    # ---------- /plan — планирование под бюджет ----------
     if _has_any(low, ["план", "спланируй", "на бюджет", "под бюджет", "кампан", "распред", "показы"]):
         budget = _parse_money(low) or 200_000
         n = _parse_int(low) or 10
         m_days = re.search(r"(\d+)\s*дн", low)
         days = int(m_days.group(1)) if m_days else 10
-        city = _extract_city(t) or "Москва"
+        city_raw = _extract_city(t)
+        city = _normalize_city_token(city_raw) if city_raw else "Москва"
         fmts = _extract_formats(low)
         owners = _extract_owners(t)
         top = " top=1" if _has_any(low, ["охватн", "самые охватные", "максимальный охват", "coverage"]) else ""
-        fmt_part = f" format={','.join(fmts)}" if fmts else ""
+        fmt_part = f" format={','.join(sorted(set(fmts)).upper() for fmts in [])}"  # placeholder (see below)
+        # ↑ маленькая хитрость ниже: правильно соберём formats
+        if fmts:
+            fmt_norm = ",".join(s.upper() for s in sorted(set(fmts)))
+            fmt_part = f" format={fmt_norm}"
+        else:
+            fmt_part = ""
+
         own_part = f" owner={','.join(owners)}" if owners else ""
         cmd = f"/plan budget={int(budget)} city={city} n={n} days={days}{fmt_part}{own_part}{top}"
         return cmd, "Планирование кампании под бюджет"
 
-    # /pick_city — выборка по городу (учитываем format и owner)
+    # ---------- /pick_city — равномерная выборка по городу ----------
     if _has_any(low, ["подбери", "выбери", "нужно", "хочу"]) and _has_any(low, ["в ", "по ", "из "]):
-        city = _extract_city(t)
-        if city:
+        city_raw = _extract_city(t)
+        if city_raw:
+            city = _normalize_city_token(city_raw)
             n = _parse_int(low) or 20
+            # форматы — только те, что явно упомянуты
             fmts = _extract_formats(low)
+            fmt_part = f" format={','.join(s.upper() for s in sorted(set(fmts)))}" if fmts else ""
+            # владельцы — из текста после «владелец/владельца/оператор/owner»
             owners = _extract_owners(t)
-            fmt_part = f" format={','.join(fmts)}" if fmts else ""
             own_part = f" owner={','.join(owners)}" if owners else ""
-            cmd = f"/pick_city {city} {n}{fmt_part}{own_part}"
-            return cmd.strip(), "Равномерная выборка по городу"
+            return f"/pick_city {city} {n}{fmt_part}{own_part}", "Равномерная выборка по городу"
 
-    # /pick_at — равномерная выборка внутри круга (если есть координаты и указан N)
+    # ---------- /near — экраны рядом / в радиусе ----------
     latlon = _extract_latlon(t)
-    if latlon and _has_any(low, ["подбери", "выбери", "хочу", "нужно"]):
-        n = _parse_int(low) or 20
-        # радиус: попытаемся вытащить «15 км», иначе по умолчанию 15
-        m_r = re.search(r"(\d+)\s*(?:км|km)", low)
-        radius = int(m_r.group(1)) if m_r else 15
-        return f"/pick_at {latlon[0]:.6f} {latlon[1]:.6f} {n} {radius}", "Равномерная выборка в круге"
-
-    # /near — посмотреть экраны вокруг точки
     if latlon or _has_any(low, ["рядом", "около", "в радиусе", "вокруг", "near", "поблизости"]):
         if latlon:
-            return f"/near {latlon[0]:.6f} {latlon[1]:.6f} 2", "Экраны в радиусе точки (пример на 2 км)"
+            return f"/near {latlon[0]:.6f} {latlon[1]:.6f} 2", "Экраны в радиусе точки (пример: 2 км)"
         else:
             return "📍 Пришлите геолокацию или используйте: /near <lat> <lon> 2", "Экраны вокруг вашей точки"
 
-    # /forecast — оценка показов
+    # ---------- /forecast — оценка показов для последней выборки ----------
     if _has_any(low, ["сколько показ", "прогноз", "forecast", "хватит ли", "оценка показов"]):
         budget = _parse_money(low)
         if budget:
@@ -957,17 +959,18 @@ def suggest_command_from_text(text: str) -> tuple[str | None, str]:
         else:
             return "/forecast days=7 hours_per_day=8", "Оценка по последней выборке"
 
-    # /sync_api — синхронизация
+    # ---------- /sync_api — подтянуть инвентарь из API ----------
     if _has_any(low, ["обнови список", "подтяни из апи", "синхронизируй", "обнови экраны", "sync api"]):
         fmts = _extract_formats(low)
-        city = _extract_city(t)
+        city_raw = _extract_city(t)
+        city = _normalize_city_token(city_raw) if city_raw else None
         parts = []
         if city: parts.append(f"city={city}")
-        if fmts: parts.append(f"formats={','.join(fmts)}")
+        if fmts: parts.append(f"formats={','.join(s.upper() for s in sorted(set(fmts)))}")
         base = "/sync_api " + " ".join(parts) if parts else "/sync_api size=500 pages=3"
         return base.strip(), "Синхронизация инвентаря из API"
 
-    # /shots — фотоотчёт по кампании
+    # ---------- /shots — фотоотчёт по кампании ----------
     if _has_any(low, ["фотоотчет", "фото отчёт", "кадры кампании", "impression", "shots"]):
         camp = _parse_int(low) or 0
         if camp > 0:
@@ -975,21 +978,22 @@ def suggest_command_from_text(text: str) -> tuple[str | None, str]:
         else:
             return "/shots campaign=<ID> per=0 limit=100", "Фотоотчёт: укажите campaign ID"
 
-    # /export_last — экспорт
+    # ---------- /export_last — экспорт ----------
     if _has_any(low, ["выгрузи", "экспорт", "csv", "xlsx", "таблица"]):
         return "/export_last", "Экспорт последней выборки"
 
-    # /radius — изменить радиус
+    # ---------- /radius — изменить радиус ----------
     if _has_any(low, ["радиус", "поставь радиус", "изменить радиус"]):
         r = _parse_int(low) or 2
         return f"/radius {r}", "Задать радиус по умолчанию (км)"
 
-    # /status /help
+    # ---------- /status /help ----------
     if _has_any(low, ["статус", "что загружено", "сколько экранов"]):
         return "/status", "Статус загруженных данных"
     if _has_any(low, ["help", "помощ", "что умеешь", "команды"]):
         return "/help", "Справка по командам"
 
+    # Ничего не распознали — мягко отправляем к /help и @enterspring
     return None, "Похоже, готовой команды для этого нет. Напишите, пожалуйста, @enterspring — она поможет добавить нужную функцию."
 
 # ===== хэндлер =====
