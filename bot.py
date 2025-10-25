@@ -751,6 +751,7 @@ import re
 from aiogram import Router, F, types
 from aiogram.utils.text_decorations import html_decoration as hd
 
+
 nlu_router = Router(name="nlu")
 
 # берём только обычный текст (не команды, не от ботов)
@@ -998,30 +999,30 @@ async def natural_language_assistant(m: types.Message):
     text = (m.text or "").strip()
     cmd, hint = suggest_command_from_text(text)
 
-    # Экран безо всяких сюрпризов для HTML
-    hint_safe = hd.quote(hint or "")
+    # глушим странные невидимые символы, чтобы не ломали HTML
+    def _clean(s: str) -> str:
+        return (s or "").replace("\u200b", "").replace("\ufeff", "").strip()
+
+    hint = _clean(hint)
+    cmd  = _clean(cmd) if cmd else None
+
+    # Собираем ответ ТОЛЬКО через hd.*, без «ручных» <b>/<i>/<code>
+    header = "Похоже, сработает это:"
+    parts = [hd.quote(header), ""]  # пустая строка = перенос
 
     if cmd:
-        cmd_safe = hd.quote(cmd.strip())
-        # Если это настоящая команда — показываем в <code>, иначе просто текстом (но экранированным)
-        if cmd.strip().startswith("/"):
-            body = (
-                "Похоже, сработает команда</b> 👉 <code>{cmd_safe}</code>\n\n"
-                f"<i>{hint_safe}</i>"
-            )
-        else:
-            body = (
-                "Похоже, вы хотите это:\n\n"
-                f"{cmd_safe}\n\n"
-                f"<i>{hint_safe}</i>"
-            )
-        await m.answer(body, parse_mode="HTML", disable_web_page_preview=True)
+        # Если это команда — показываем в <code>, иначе просто как текст
+        line = hd.bold("Советую команду") + " 👉 " + (hd.code(cmd) if cmd.startswith("/") else hd.quote(cmd))
+        parts.append(line)
+        if hint:
+            parts += ["", hd.italic(hint)]
+        body = "\n".join(parts)
     else:
-        await m.answer(
-            f"{hint_safe}\n\nА пока можно посмотреть доступные команды: /help",
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+        # Нет подходящей команды — мягко шлём к /help и @enterspring
+        tail = "А пока можно посмотреть доступные команды: /help"
+        body = hd.quote(hint) + "\n\n" + hd.quote(tail)
+
+    await m.answer(body, parse_mode="HTML", disable_web_page_preview=True)
 
 # Подключение NLU-роутера ДОЛЖНО быть выше, чем основной:
 dp.include_router(nlu_router)
