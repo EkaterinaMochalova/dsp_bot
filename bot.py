@@ -843,7 +843,7 @@ async def cmd_examples(m: types.Message):
     await m.answer(text, reply_markup=make_main_menu())
 
 # ---------- Cинк из API ----------
-@router.message(Command("sync_api")))
+@router.message(Command("sync_api"))
 async def cmd_sync_api(m: types.Message):
     if not _owner_only(m.from_user.id):
         await m.answer("⛔️ Только владелец бота может выполнять эту команду.")
