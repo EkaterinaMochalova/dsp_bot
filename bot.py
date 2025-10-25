@@ -180,6 +180,23 @@ if not BOT_TOKEN:
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
+from aiogram.filters import Command
+from aiogram import types
+
+@dp.message(Command("cache_info"))
+async def cache_info(m: types.Message):
+    try:
+        lines = [
+            f"CACHE_DIR: {CACHE_DIR}",
+            f"exists: {CACHE_DIR.exists()}",
+            f"writable: {os.access(CACHE_DIR, os.W_OK)}",
+            f"CACHE_CSV exists: {CACHE_CSV.exists()}",
+            f"CACHE_META exists: {CACHE_META.exists()}",
+        ]
+        await m.answer("\n".join(lines))
+    except Exception as e:
+        await m.answer(f"cache_info error: {e}")
+
 # ====== ХРАНИЛИЩЕ (MVP) ======
 SCREENS: pd.DataFrame | None = None
 USER_RADIUS: dict[int, float] = {}
