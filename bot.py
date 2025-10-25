@@ -19,6 +19,7 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile  # для отправки файлов из памяти
 
+
 def _ssl_ctx_certifi() -> ssl.SSLContext:
     """Создаёт безопасный SSL-контекст с CA из certifi, если доступен."""
     if certifi is not None:
@@ -61,6 +62,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SCREENS_PATH = os.path.join(DATA_DIR, "screens.csv")
 SCREENS = None
 LAST_RESULT = None
+LAST_SELECTION_NAME = "last"      # имя для файлов (можешь менять)
+MAX_PLAYS_PER_HOUR = 6            # сколько выходов/час на экран (твоя бизнес-логика)
 
 # — новые переменные для кэша —
 from pathlib import Path
@@ -134,6 +137,72 @@ def make_main_menu() -> ReplyKeyboardMarkup:
     )
 
 # ====== УТИЛИТЫ ======
+
+
+def _parse_hours_windows(s: str | None) -> int | None:
+    """
+    Простой парсер окон часов вида '07-10,17-21' -> суммарно часов в день.
+    Если формат не распознан — вернёт None.
+    """
+    if not s:
+        return None
+    total = 0
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    for p in parts:
+        if "-" in p:
+            a, b = p.split("-", 1)
+            try:
+                a = int(a); b = int(b)
+                if 0 <= a <= 23 and 0 <= b <= 23:
+                    if b > a:
+                        total += (b - a)
+                    else:
+                        # поддержим «через полночь», например 22-02
+                        total += (24 - a + b)
+            except Exception:
+                pass
+    return total or None
+
+def _fill_min_bid(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Формирует колонку min_bid_used и её источник.
+    Логика:
+      1) берём df['minBid'] если есть;
+      2) иначе пробуем df['min_bid'] / df['min_bid_rub'] / df['min_bid_rur'];
+      3) иначе подставляем медиану по имеющимся значениям, если они есть.
+    """
+    out = df.copy()
+    src_col = None
+    for cand in ("minBid", "min_bid", "min_bid_rub", "min_bid_rur"):
+        if cand in out.columns:
+            src_col = cand
+            break
+
+    if src_col:
+        vals = pd.to_numeric(out[src_col], errors="coerce")
+        median = float(vals.median()) if not vals.dropna().empty else None
+        out["min_bid_used"] = vals.fillna(median if median else 0)
+        out["min_bid_source"] = src_col
+    else:
+        # нет ни одной подходящей колонки — вернём как есть, дальше код аккуратно упадёт с сообщением
+        out["min_bid_used"] = None
+        out["min_bid_source"] = None
+    return out
+
+def _distribute_slots_evenly(n_items: int, total_slots: int) -> list[int]:
+    """
+    Равномерно распределяет total_slots по n_items, разницу +/-1 раздаёт первым.
+    Возвращает список длиной n_items.
+    """
+    if n_items <= 0 or total_slots <= 0:
+        return [0] * max(0, n_items)
+    base = total_slots // n_items
+    extra = total_slots % n_items
+    res = [base] * n_items
+    for i in range(extra):
+        res[i] += 1
+    return res
+
 def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
     lat1, lon1 = map(math.radians, a)
     lat2, lon2 = map(math.radians, b)
@@ -251,6 +320,8 @@ def apply_filters(df: pd.DataFrame, kwargs: dict[str,str]) -> pd.DataFrame:
       - owner=...   (один или несколько: comma/; / |), подстрочный поиск (case-insensitive)
     """
     out = df
+
+
 
     # -------- FORMAT --------
     fmt_val = kwargs.get("format") or kwargs.get("formats") or kwargs.get("format_in")
@@ -706,6 +777,748 @@ async def _fetch_inventories(
                         pass
 
     return items
+
+
+@dp.message(Command("forecast"))
+async def cmd_forecast(m: types.Message):
+    """
+    /forecast [budget=...] [days=7] [hours_per_day=8] [hours=07-10,17-21]
+    Работает по последней выборке (LAST_RESULT).
+    """
+    global LAST_RESULT
+    if LAST_RESULT is None or LAST_RESULT.empty:
+        await m.answer("Нет последней выборки. Сначала подберите экраны (/pick_city, /pick_any, /pick_at, /near или через /ask).")
+        return
+
+    parts = (m.text or "").strip().split()[1:]
+    kv = {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            kv[k.strip().lower()] = v.strip()
+
+    budget = None
+    if "budget" in kv:
+        try:
+            # поддержим суффиксы m/k
+            v = kv["budget"].lower().replace(" ", "")
+            if v.endswith("m"): budget = float(v[:-1]) * 1_000_000
+            elif v.endswith("k"): budget = float(v[:-1]) * 1_000
+            else: budget = float(v)
+        except Exception:
+            budget = None
+
+    days = int(kv.get("days", 7)) if str(kv.get("days","")).isdigit() else 7
+
+    hours_per_day = None
+    if "hours_per_day" in kv:
+        try:
+            hours_per_day = int(kv["hours_per_day"])
+        except Exception:
+            hours_per_day = None
+
+    hours = kv.get("hours", "")
+    win_hours = _parse_hours_windows(hours) if hours else None
+    if hours_per_day is None:
+        hours_per_day = (win_hours if (win_hours is not None) else 8)
+
+    # подготовка данных и minBid
+    base = LAST_RESULT.copy()
+    base = _fill_min_bid(base)
+
+    # средняя минимальная ставка
+    mb_valid = pd.to_numeric(base["min_bid_used"], errors="coerce").dropna()
+    if mb_valid.empty:
+        await m.answer("Не удалось оценить ставку: ни у одного экрана нет minBid (и нечего подставить).")
+        return
+    avg_min = float(mb_valid.mean())
+
+    n_screens = len(base)
+    capacity  = n_screens * days * hours_per_day * MAX_PLAYS_PER_HOUR  # максимум выходов
+
+    if budget is not None:
+        # по бюджету — считаем выходы от средней ставки
+        total_slots = int(budget // avg_min)
+        total_slots = min(total_slots, capacity)
+    else:
+        # без бюджета — максимум частоты
+        total_slots = capacity
+        budget = total_slots * avg_min
+
+    # распределяем по экранам
+    per_screen = _distribute_slots_evenly(n_screens, total_slots)
+
+    # добавим план в таблицу
+    base = base.reset_index(drop=True)
+    base["planned_slots"] = per_screen
+    # считаем стоимость точнее — умножая на индивидуальный min_bid_used
+    base["planned_cost"]  = base["planned_slots"] * pd.to_numeric(base["min_bid_used"], errors="coerce").fillna(avg_min)
+
+    # сводка
+    total_cost  = float(base["planned_cost"].sum())
+    total_slots = int(base["planned_slots"].sum())
+
+    # аккуратный экспорт
+    export_cols = []
+    for c in ("screen_id","name","city","format","owner","lat","lon","minBid","min_bid_used","min_bid_source","planned_slots","planned_cost"):
+        if c in base.columns:
+            export_cols.append(c)
+    plan_df = base[export_cols].copy()
+
+    # CSV + XLSX
+    try:
+        csv_bytes = plan_df.to_csv(index=False).encode("utf-8-sig")
+        await bot.send_document(
+            m.chat.id,
+            BufferedInputFile(csv_bytes, filename=f"forecast_{LAST_SELECTION_NAME}.csv"),
+            caption=f"Прогноз (средн. minBid≈{avg_min:,.0f}): {total_slots} выходов, бюджет≈{total_cost:,.0f} ₽"
+        )
+    except Exception as e:
+        await m.answer(f"⚠️ Не удалось отправить CSV: {e}")
+
+    try:
+        import io as _io
+        xbuf = _io.BytesIO()
+        with pd.ExcelWriter(xbuf, engine="openpyxl") as w:
+            plan_df.to_excel(w, index=False, sheet_name="forecast")
+        xbuf.seek(0)
+        await bot.send_document(
+            m.chat.id,
+            BufferedInputFile(xbuf.getvalue(), filename=f"forecast_{LAST_SELECTION_NAME}.xlsx"),
+            caption=f"Прогноз (подробно): дни={days}, часы/день={hours_per_day}, max {MAX_PLAYS_PER_HOUR}/час"
+        )
+    except Exception as e:
+        await m.answer(f"⚠️ Не удалось отправить XLSX: {e}")
+
+# --- helpers: запуск логики pick_city без подмены Message ---
+
+import re
+
+async def _run_pick_city(
+    m: types.Message,
+    city: str,
+    n: int,
+    formats: list[str] | None = None,
+    owners: list[str] | None = None,
+    fields: list[str] | None = None,
+    shuffle: bool = True,
+    fixed: bool = False,
+    seed: int | None = None,
+):
+    global SCREENS, LAST_RESULT
+
+    if SCREENS is None or SCREENS.empty:
+        await m.answer("Сначала загрузите инвентарь: /sync_api или пришлите CSV/XLSX.")
+        return
+
+    df = SCREENS
+    sub = df[df["city"].astype(str).str.strip().str.lower() == city.strip().lower()]
+
+    if formats:
+        formats_u = {f.strip().upper() for f in formats if f.strip()}
+        if "format" in sub.columns:
+            sub = sub[sub["format"].astype(str).str.upper().isin(formats_u)]
+
+    if owners:
+        if "owner" in sub.columns:
+            pat = "|".join(re.escape(o) for o in owners if o.strip())
+            sub = sub[sub["owner"].astype(str).str.contains(pat, case=False, na=False)]
+
+    if sub.empty:
+        await m.answer(f"Не нашёл экранов в городе «{city}» с заданными фильтрами.")
+        return
+
+    if shuffle:
+        sub = sub.sample(frac=1, random_state=None).reset_index(drop=True)
+
+    # равномерная выборка (твоя существующая функция)
+    res = spread_select(
+        sub.reset_index(drop=True),
+        n,
+        random_start=not fixed,
+        seed=seed
+    )
+    LAST_RESULT = res
+
+    # если попросили конкретные поля — отдадим компактно
+    if fields:
+        ok_fields = [c for c in fields if c in res.columns]
+        if not ok_fields:
+            await m.answer("Поля не распознаны. Доступные: " + ", ".join(res.columns))
+            return
+        view = res[ok_fields]
+        if ok_fields == ["screen_id"]:
+            ids = [str(x) for x in view["screen_id"].tolist()]
+            await send_lines(m, ids, header=f"Выбрано {len(ids)} screen_id по городу «{city}»:")
+        else:
+            lines = [" | ".join(str(r[c]) for c in ok_fields) for _, r in view.iterrows()]
+            await send_lines(m, lines, header=f"Выбрано {len(view)} экранов по городу «{city}» (поля: {', '.join(ok_fields)}):")
+
+        # приложим XLSX с GID, если есть
+        await send_gid_if_any(m, res, filename="city_screen_ids.xlsx",
+                              caption=f"GID по городу «{city}» (XLSX)")
+        return
+
+    # дефолтный вывод
+    lines = []
+    for _, r in res.iterrows():
+        nm = r.get("name","") or r.get("screen_id","")
+        fmt = r.get("format",""); own = r.get("owner","")
+        lat = r.get("lat"); lon = r.get("lon")
+        lines.append(f"• {r.get('screen_id','')} — {nm} [{lat:.5f},{lon:.5f}] [{fmt} / {own}]")
+    await send_lines(m, lines, header=f"Выбрано {len(res)} экранов по городу «{city}» (равномерно):")
+
+    await send_gid_if_any(m, res, filename="city_screen_ids.xlsx",
+                          caption=f"GID по городу «{city}» (XLSX)")
+
+
+# ====== УТИЛИТЫ ======
+def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
+    lat1, lon1 = map(math.radians, a)
+    lat2, lon2 = map(math.radians, b)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    r = 6371.0088
+    h = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
+    return 2 * r * math.asin(math.sqrt(h))
+
+def find_within_radius(df: pd.DataFrame, center: tuple[float,float], radius_km: float) -> pd.DataFrame:
+    rows = []
+    for _, row in df.iterrows():
+        d = haversine_km(center, (row["lat"], row["lon"]))
+        if d <= radius_km:
+            rows.append({
+                "screen_id": row.get("screen_id", ""),
+                "name": row.get("name", ""),
+                "city": row.get("city", ""),
+                "format": row.get("format", ""),
+                "owner": row.get("owner", ""),
+                "lat": row["lat"],
+                "lon": row["lon"],
+                "distance_km": round(d, 3),
+            })
+    out = pd.DataFrame(rows)
+    return out.sort_values("distance_km") if not out.empty else out
+
+def spread_select(df: pd.DataFrame, n: int, *, random_start: bool = True, seed: int | None = None) -> pd.DataFrame:
+    """Жадный k-center (Gonzalez) c рандомным стартом и случайными тай-брейками."""
+    import random as _random
+    if df.empty or n <= 0:
+        return df.iloc[0:0]
+    n = min(n, len(df))
+
+    if seed is not None:
+        _random.seed(seed)
+
+    coords = df[["lat", "lon"]].to_numpy()
+
+    # старт: случайный (или от медианы, если random_start=False)
+    if random_start:
+        start_idx = _random.randrange(len(df))
+    else:
+        lat_med = float(df["lat"].median())
+        lon_med = float(df["lon"].median())
+        start_idx = min(
+            range(len(df)),
+            key=lambda i: haversine_km((lat_med, lon_med), (coords[i][0], coords[i][1]))
+        )
+
+    chosen = [start_idx]
+    dists = [
+        haversine_km((coords[start_idx][0], coords[start_idx][1]), (coords[i][0], coords[i][1]))
+        for i in range(len(df))
+    ]
+
+    while len(chosen) < n:
+        maxd = max(dists)
+        candidates = [i for i, d in enumerate(dists) if d == maxd]
+        next_idx = _random.choice(candidates)  # случайный выбор среди самых «дальних»
+        chosen.append(next_idx)
+        cx, cy = coords[next_idx]
+        for i in range(len(df)):
+            d = haversine_km((cx, cy), (coords[i][0], coords[i][1]))
+            if d < dists[i]:
+                dists[i] = d
+
+    res = df.iloc[chosen].copy()
+    # инфо-поле: минимальная дистанция до ближайшего выбранного
+    res["min_dist_to_others_km"] = 0.0
+    cc = res[["lat","lon"]].to_numpy()
+    for i in range(len(res)):
+        mind = min(
+            haversine_km((cc[i][0], cc[i][1]), (cc[j][0], cc[j][1]))
+            for j in range(len(res)) if j != i
+        ) if len(res) > 1 else 0.0
+        res.iat[i, res.columns.get_loc("min_dist_to_others_km")] = round(mind, 3)
+    return res
+
+def parse_kwargs(parts: list[str]) -> dict[str, str]:
+    """Парсим хвост команды вида key=value (значения можно брать в кавычки)."""
+    out: dict[str,str] = {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+def _split_list(val: str) -> list[str]:
+    if not val:
+        return []
+    return [x.strip() for x in val.replace(";", ",").split(",") if x.strip()]
+
+def parse_fields(arg: str) -> list[str]:
+    allowed = {
+        "screen_id","name","city","format","owner","lat","lon",
+        "distance_km","min_dist_to_others_km"
+    }
+    cols = [c.strip() for c in arg.split(",")]
+    return [c for c in cols if c in allowed]
+
+def parse_list(val: str) -> list[str]:
+    if not isinstance(val, str):
+        return []
+    # поддерживаем разделители: запятая, точка с запятой, вертикальная черта
+    for sep in ("|", ";"):
+        val = val.replace(sep, ",")
+    return [x.strip() for x in val.split(",") if x.strip()]
+
+def apply_filters(df: pd.DataFrame, kwargs: dict[str,str]) -> pd.DataFrame:
+    """
+    Поддержка:
+      - format=...  (один или несколько: comma/; / |)
+        спец-алиас: city / гиды → все, что начинается с CITY_FORMAT
+      - owner=...   (один или несколько: comma/; / |), подстрочный поиск (case-insensitive)
+    """
+    out = df
+
+    # -------- FORMAT --------
+    fmt_val = kwargs.get("format") or kwargs.get("formats") or kwargs.get("format_in")
+    if fmt_val:
+        fmt_list_raw = parse_list(fmt_val)
+        fmt_list = [s.upper() for s in fmt_list_raw]
+        mask = None
+        col = out["format"].astype(str).str.upper()
+
+        for f in fmt_list:
+            if f.lower() in {"city", "city_format", "cityformat", "citylight", "гид", "гиды"}:
+                m = col.str.startswith("CITY_FORMAT")
+            else:
+                m = (col == f)
+            mask = m if mask is None else (mask | m)
+
+        if mask is not None:
+            out = out[mask]
+
+    # -------- OWNER --------
+    own_val = kwargs.get("owner") or kwargs.get("owners") or kwargs.get("owner_in")
+    if own_val:
+        owners = parse_list(own_val)
+        mask = None
+        col = out["owner"].astype(str).str.lower()
+        for o in owners:
+            m = col.str.contains(o.strip().lower())
+            mask = m if mask is None else (mask | m)
+        if mask is not None:
+            out = out[mask]
+
+    return out
+
+import io
+from aiogram.types import BufferedInputFile
+
+# Разбивка длинного ответа на части (чтобы Телеграм всё уместил)
+async def send_lines(message, lines, header: str | None = None, chunk: int = 60, parse_mode: str | None = None):
+    """
+    Отправляет список строк пачками.
+    - chunk: макс. кол-во строк в одном сообщении (доп. ограничение)
+    - также режет по лимиту символов Telegram (~4096), используем запас 3900.
+    """
+    if not lines:
+        if header:
+            await message.answer(header, parse_mode=parse_mode)
+        return
+
+    # отправим заголовок отдельным сообщением
+    if header:
+        await message.answer(header, parse_mode=parse_mode)
+
+    MAX_CHARS = 3900  # небольшой запас к лимиту Telegram
+    buf: list[str] = []
+    buf_len = 0
+    buf_cnt = 0
+
+    for line in lines:
+        s = str(line)
+        # если строка сама по себе слишком длинная — порежем грубо по символам
+        if len(s) > MAX_CHARS:
+            # сначала выльем накопленное
+            if buf:
+                await message.answer("\n".join(buf), parse_mode=parse_mode)
+                buf, buf_len, buf_cnt = [], 0, 0
+            # порезать одну очень длинную строку
+            for i in range(0, len(s), MAX_CHARS):
+                await message.answer(s[i:i+MAX_CHARS], parse_mode=parse_mode)
+            continue
+
+        # проверяем, влезет ли следующая строка в текущий буфер
+        if buf and (buf_len + 1 + len(s) > MAX_CHARS or buf_cnt >= chunk):
+            await message.answer("\n".join(buf), parse_mode=parse_mode)
+            buf, buf_len, buf_cnt = [], 0, 0
+
+        # добавляем строку
+        buf.append(s)
+        buf_len += (len(s) + 1)  # +1 за перевод строки
+        buf_cnt += 1
+
+    # добросим остаток
+    if buf:
+        await message.answer("\n".join(buf), parse_mode=parse_mode)
+
+def _format_mask(series: pd.Series, token: str) -> pd.Series:
+    """
+    Булева маска по формату:
+      - 'city', 'гид', ... → всё, что начинается с CITY_FORMAT
+      - 'billboard', 'bb'  → BILLBOARD
+      - иначе — точное сравнение по верхнему регистру
+    Пробелы и регистр игнорируются.
+    """
+    col = series.astype(str).str.upper().str.strip()
+    t = token.strip().upper()
+    if t in {"CITY", "CITY_FORMAT", "CITYFORMAT", "CITYLIGHT", "ГИД", "ГИДЫ"}:
+        return col.str.startswith("CITY_FORMAT")
+    if t in {"BILLBOARD", "BB"}:
+        return col == "BILLBOARD"
+    return col == t
+
+
+def save_screens_cache(df: pd.DataFrame):
+    """Сохраняет кэш на диск в data/screens_cache.*"""
+    global LAST_SYNC_TS
+
+    try:
+        if df is None or df.empty:
+            return False
+
+        # сохраняем parquet и csv
+        df.to_parquet(CACHE_PARQUET, index=False)
+        df.to_csv(CACHE_CSV, index=False, encoding="utf-8-sig")
+
+        LAST_SYNC_TS = time.time()
+        meta = {"ts": LAST_SYNC_TS, "rows": len(df)}
+        CACHE_META.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        print(f"💾 Кэш сохранён на диск: {len(df)} строк.")
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка при сохранении кэша: {e}")
+        return False
+
+
+def load_screens_cache() -> bool:
+    """Пытается поднять инвентарь из кэша. Возвращает True/False — удалось ли."""
+    global SCREENS, LAST_SYNC_TS
+
+    df: pd.DataFrame | None = None
+
+    # предпочитаем parquet — быстрее
+    if CACHE_PARQUET.exists():
+        try:
+            df = pd.read_parquet(CACHE_PARQUET)
+        except Exception:
+            df = None
+
+    # если parquet не удалось — пробуем csv
+    if df is None and CACHE_CSV.exists():
+        try:
+            df = pd.read_csv(CACHE_CSV)
+        except Exception:
+            df = None
+
+    if df is None or df.empty:
+        return False
+
+    SCREENS = df
+
+    # читаем метаданные (время/кол-во), если есть
+    try:
+        meta = json.loads(CACHE_META.read_text(encoding="utf-8"))
+        LAST_SYNC_TS = float(meta.get("ts")) if "ts" in meta else None
+    except Exception:
+        LAST_SYNC_TS = None
+
+    return True
+
+if load_screens_cache():
+    logging.info(f"Loaded screens cache: {len(SCREENS)} rows, ts={LAST_SYNC_TS}")
+else:
+    logging.info("No local screens cache found.")
+
+def parse_mix(val: str) -> list[tuple[str, str]]:
+    """
+    Разбор строки mix=... на пары (token, value_str).
+    Поддерживает разделители: ',', ';', '|'
+    Примеры:
+      "BILLBOARD:90%,CITY:10%"
+      "CITY_FORMAT_RC:5,CITY_FORMAT_WD:15"
+    """
+    if not isinstance(val, str) or not val.strip():
+        return []
+    s = val.replace("|", ",").replace(";", ",")
+    items = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        token, v = part.split(":", 1)
+        items.append((token.strip(), v.strip()))
+    return items
+
+def reach_score(item: dict, hours_per_day: int) -> float:
+    # 1) если есть GRP — приоритизируем его (как «охватность» экрана)
+    g = item.get("grp")
+    if g is not None:
+        try:
+            return float(g)
+        except Exception:
+            pass
+
+    # 2) иначе OTS как суррогат
+    ots = item.get("ots")
+    if ots is not None:
+        try:
+            return float(ots)
+        except Exception:
+            pass
+
+    # 3) прежние эвристики (fallback)
+    a = (item.get("audience_per_day") or item.get("audiencePerDay") or 0) or 0
+    if a:
+        return float(a)
+
+    traffic_h = item.get("traffic_per_hour") or item.get("trafficPerHour")
+    vis = item.get("visibility_index") or item.get("visibilityIndex") or 1.0
+    if traffic_h:
+        try:
+            return float(traffic_h) * hours_per_day * float(vis)
+        except Exception:
+            return float(traffic_h) * hours_per_day
+
+    vpl = item.get("viewers_per_loop") or item.get("viewersPerLoop")
+    lph = item.get("loops_per_hour") or item.get("loopsPerHour")
+    if vpl and lph:
+        try:
+            return float(vpl) * float(lph) * hours_per_day
+        except Exception:
+            return float(vpl) * hours_per_day
+
+    return 0.0
+
+# -------- helpers --------
+
+import re
+
+def parse_kv(text: str) -> dict:
+    """
+    Разбирает строку вида "key=val key2=val2" или с разделителями запятыми/точками с запятой.
+    Возвращает dict с ключами в нижнем регистре.
+    """
+    kv = {}
+    # поддерживаем "key=val key=val", а также разделители , ; \n
+    parts = re.split(r"[,\n;]\s*|\s+(?=\w+=)", text.strip())
+    for part in parts:
+        if "=" in part:
+            k, v = part.split("=", 1)
+            kv[k.strip().lower()] = v.strip()
+    return kv
+
+def _allocate_counts(total_n: int, mix_items: list[tuple[str, str]]) -> list[tuple[str, int]]:
+    """
+    Вход: [('BILLBOARD','90%'), ('CITY','10%')] или [('BILLBOARD','18'), ('CITY','2')]
+    Выход: [('BILLBOARD', 18), ('CITY', 2)]
+    Правила:
+      - если есть суффикс '%', считаем проценты (с округлением и распределением остатка)
+      - числа без % трактуются как фиксированные штуки
+      - допускается смешанный режим: фиксированные + проценты на остаток
+    """
+    fixed: list[tuple[str, int]] = []
+    perc:  list[tuple[str, float]] = []
+
+    for token, v in mix_items:
+        if v.endswith("%"):
+            try:
+                perc.append((token, float(v[:-1])))
+            except:
+                pass
+        else:
+            try:
+                fixed.append((token, int(v)))
+            except:
+                pass
+
+    # фиксированная часть
+    fixed_sum = sum(cnt for _, cnt in fixed)
+    remaining = max(0, total_n - fixed_sum)
+
+    # процентная часть
+    out: list[tuple[str, int]] = fixed[:]
+    if remaining > 0 and perc:
+        p_total = sum(p for _, p in perc)
+        if p_total <= 0:
+            # если проценты заданы, но сумма нулевая/некорректная — просто отдаём всё первому
+            out.append((perc[0][0], remaining))
+        else:
+            # базовое распределение + раздача остатков по убыванию дробной части
+            raw = [(tok, remaining * p / p_total) for tok, p in perc]
+            base = [(tok, int(x)) for tok, x in raw]
+            used = sum(cnt for _, cnt in base)
+            rem  = remaining - used
+            fracs = sorted(((x - int(x), tok) for tok, x in raw), reverse=True)
+            extra = {}
+            for i in range(rem):
+                _, tok = fracs[i % len(fracs)]
+                extra[tok] = extra.get(tok, 0) + 1
+            # собрать результат
+            for tok, cnt in base:
+                out.append((tok, cnt + extra.get(tok, 0)))
+
+    # если проценты есть, а фиксированных нет и remaining==0 (n перекрыто фиксами) — просто out уже готов
+    # убедимся, что суммарно не превышаем total_n (на всякий)
+    total = sum(cnt for _, cnt in out)
+    if total > total_n:
+        # отрежем лишнее с конца
+        delta = total - total_n
+        trimmed = []
+        for tok, cnt in out:
+            take = max(0, cnt - delta)
+            delta -= (cnt - take)
+            trimmed.append((tok, take))
+            if delta <= 0:
+                trimmed.extend(out[len(trimmed):])
+                break
+        out = trimmed
+    return out
+
+
+def _select_with_mix(df_city: pd.DataFrame, n: int, mix_arg: str | None,
+                     *, random_start: bool = True, seed: int | None = None) -> pd.DataFrame:
+    """
+    Делит датафрейм на поднаборы по форматам согласно mix, равномерно выбирает внутри каждого,
+    объединяет и добирает остаток ТОЛЬКО из разрешённых форматов mix.
+    """
+    # без mix → обычный равномерный выбор
+    if not mix_arg:
+        return spread_select(df_city.reset_index(drop=True), n, random_start=random_start, seed=seed)
+
+    items = parse_mix(mix_arg)
+    if not items:
+        return spread_select(df_city.reset_index(drop=True), n, random_start=random_start, seed=seed)
+
+    # список разрешённых форматов из mix (как токены)
+    allowed_tokens = [tok for tok, _ in items]
+
+    # сузим исходный пул сразу только к разрешённым форматам
+    if "format" not in df_city.columns:
+        # на всякий — если нет колонки format, падаем в обычный режим
+        base_pool = df_city.copy()
+    else:
+        mask_allowed = None
+        col = df_city["format"]
+        for tok in allowed_tokens:
+            m = _format_mask(col, tok)
+            mask_allowed = m if mask_allowed is None else (mask_allowed | m)
+        base_pool = df_city[mask_allowed] if mask_allowed is not None else df_city.copy()
+
+    if base_pool.empty:
+        # ничего из указанных форматов — вернём обычный равномерный из всего (чтобы не пусто)
+        return spread_select(df_city.reset_index(drop=True), n, random_start=random_start, seed=seed)
+
+    targets = _allocate_counts(n, items)  # [('BILLBOARD', 18), ('CITY', 2)]
+    selected_parts: list[pd.DataFrame] = []
+    used_ids: set[str] = set()
+
+    pool = base_pool.copy()
+
+    # выбираем по квотам
+    for token, need in targets:
+        if need <= 0 or pool.empty:
+            continue
+        mask = _format_mask(pool["format"], token) if "format" in pool.columns else pd.Series([True]*len(pool), index=pool.index)
+        subset = pool[mask]
+        if subset.empty:
+            continue
+        pick_n = min(need, len(subset))
+        picked = spread_select(subset.reset_index(drop=True), pick_n, random_start=random_start, seed=seed)
+        selected_parts.append(picked)
+
+        # исключим выбранные из пула
+        if "screen_id" in pool.columns and "screen_id" in picked.columns:
+            chosen_ids = picked["screen_id"].astype(str).tolist()
+            used_ids.update(chosen_ids)
+            pool = pool[~pool["screen_id"].astype(str).isin(used_ids)]
+        else:
+            # fallback по координатам
+            coords = set((float(a), float(b)) for a, b in picked[["lat","lon"]].itertuples(index=False, name=None))
+            pool = pool[~((pool["lat"].astype(float).round(7).isin([x for x, _ in coords])) &
+                          (pool["lon"].astype(float).round(7).isin([y for _, y in coords])))]
+        if pool.empty:
+            break
+
+    combined = pd.concat(selected_parts, ignore_index=True) if selected_parts else base_pool.iloc[0:0]
+
+    # добираем недостающее ТОЛЬКО из base_pool (разрешённые форматы)
+    remain = n - len(combined)
+    if remain > 0 and not pool.empty:
+        extra = spread_select(pool.reset_index(drop=True), min(remain, len(pool)), random_start=random_start, seed=seed)
+        combined = pd.concat([combined, extra], ignore_index=True)
+
+    return combined.head(n)
+async def send_gid_xlsx(chat_id: int, ids: list[str], *, filename: str = "screen_ids.xlsx", caption: str = "GID список (XLSX)"):
+    """Отправка XLSX с одним столбцом GID из списка screen_id."""
+    df = pd.DataFrame({"GID": [str(x) for x in ids]})
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    bio.seek(0)
+    await bot.send_document(
+        chat_id,
+        BufferedInputFile(bio.read(), filename=filename),
+        caption=caption,
+    )
+
+async def send_gid_if_any(message: types.Message, df: pd.DataFrame, *, filename: str, caption: str):
+    """Если в df есть колонка screen_id и там не пусто — отправляем XLSX с колонкой GID."""
+    if df is None or df.empty or "screen_id" not in df.columns:
+        return
+    ids = [s for s in (df["screen_id"].astype(str).tolist()) if str(s).strip() and str(s).lower() != "nan"]
+    if ids:
+        await send_gid_xlsx(message.chat.id, ids, filename=filename, caption=caption)
+
+# --- ACCESS CONTROL HELPERS ---
+
+def _owner_only(user_id: int) -> bool:
+    return TELEGRAM_OWNER_ID == 0 or user_id == TELEGRAM_OWNER_ID
+
+def _auth_headers_all_variants(token: str) -> list[tuple[str, dict]]:
+    """
+    Возвращает список (label, headers). label — чтобы красиво логировать, что мы пробовали.
+    """
+    t = (token or "").strip()
+    if not t:
+        return [("no-auth", {})]
+    return [
+        ("Bearer",      {"Authorization": f"Bearer {t}"}),
+        ("Token",       {"Authorization": f"Token {t}"}),
+        ("X-API-Key",   {"X-API-Key": t}),
+        ("x-api-key",   {"x-api-key": t}),
+        ("X-Auth-Token",{"X-Auth-Token": t}),
+        ("Auth-Token",  {"Auth-Token": t}),
+        ("authToken",   {"authToken": t}),
+        ("Cookie",      {"Cookie": f"authToken={t}"}),
+    ]
+
+from urllib.parse import urljoin
+import json, aiohttp, logging
+
 # --- PHOTO REPORTS (impression-shots/export) ---
 import aiohttp
 
