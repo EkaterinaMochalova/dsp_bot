@@ -114,13 +114,10 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 def make_main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="/help"), KeyboardButton(text="/status")],
-            [KeyboardButton(text="/plan budget=200000 city=Москва n=10 days=10 hours_per_day=8")],
-            [KeyboardButton(text="/near 55.714349 37.553834 2"), KeyboardButton(text="/pick_city Москва 20")],
-            [KeyboardButton(text="/export_last"), KeyboardButton(text="/radius 2")],
+            [KeyboardButton(text="/help"), KeyboardButton(text="/status"), KeyboardButton(text="/start")],
         ],
         resize_keyboard=True,
-        input_field_placeholder="Например: /plan budget=200000 city=Москва n=10 days=10 hours_per_day=8"
+        input_field_placeholder="Например: /pick_city Москва 20 — равномерно 20 экранов по городу"
     )
 
 # ====== Кэш-инфраструктура ======
@@ -744,16 +741,181 @@ if not BOT_TOKEN:
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+nlu_router = Router(name="nlu")
 router = Router()
+
+
+# ---------- NLU-подсказки по свободному тексту ----------
+import re
+from aiogram.utils.text_decorations import html_decoration as hd
+
+@nlu_router.message(F.text & ~F.via_bot)
+async def natural_language_assistant(m: types.Message):
+    text = (m.text or "").strip()
+    cmd, hint = suggest_command_from_text(text)
+    if cmd:
+        await m.answer(
+            f"Похоже, вы хотите это:\n\n<b>Советую команду</b> 👉 <code>{cmd}</code>\n\n<i>{hd.quote(hint)}</i>",
+            parse_mode="HTML"
+        )
+    else:
+        await m.answer(
+            f"{hd.quote(hint)}\n\n"
+            "А пока можно посмотреть доступные команды: /help",
+            parse_mode="HTML"
+        )
+
+
+dp.include_router(nlu_router)
+
+# Нормализация чисел типа "200к", "1.5м"
+def _parse_money(s: str) -> float | None:
+    s = s.lower().replace(" ", "")
+    m = re.findall(r"[\d]+(?:[.,]\d+)?", s)
+    if not m:
+        return None
+    val = float(m[0].replace(",", "."))
+    if "м" in s or "m" in s:
+        val *= 1_000_000
+    elif "к" in s or "k" in s:
+        val *= 1_000
+    return val
+
+def _parse_int(s: str) -> int | None:
+    m = re.search(r"\b(\d{1,6})\b", s)
+    return int(m.group(1)) if m else None
+
+def _extract_city(text: str) -> str | None:
+    # очень простой хак: слова после "в " или "по " до конца/цифры/знака препинания
+    m = re.search(r"(?:в|по)\s+([А-ЯA-ZЁ][\w\- ]{2,})", text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    cand = m.group(1).strip()
+    cand = re.split(r"[,.!?:;0-9]", cand)[0].strip()
+    return cand if len(cand) >= 2 else None
+
+def _extract_latlon(text: str):
+    m = re.search(r"(-?\d{1,2}\.\d+)[, ]+(-?\d{1,3}\.\d+)", text)
+    if m:
+        try:
+            return float(m.group(1)), float(m.group(2))
+        except Exception:
+            return None
+    return None
+
+def _has_any(text: str, words: list[str]) -> bool:
+    t = text.lower()
+    return any(w in t for w in words)
+
+def _extract_formats(text: str) -> list[str]:
+    t = text.lower()
+    fmts = []
+    if "billboard" in t or "билбор" in t or "биллбор" in t:
+        fmts.append("billboard")
+    if "supersite" in t or "суперсайт" in t:
+        fmts.append("supersite")
+    if "city" in t or "сити" in t or "гид" in t:
+        fmts.append("city")
+    # можно расширить по мере надобности
+    return fmts
+
+def _extract_owners(text: str) -> list[str]:
+    # ключевые слова "владелец", "оператор", "owner" + слово(а) после
+    m = re.search(r"(?:owner|владелец|оператор)[=: ]+([^\n,;]+)", text, flags=re.IGNORECASE)
+    if not m:
+        return []
+    vals = re.split(r"[;,\| ]+", m.group(1).strip())
+    return [v for v in vals if v]
+
+def suggest_command_from_text(text: str) -> tuple[str | None, str]:
+    t = text.strip()
+    low = t.lower()
+
+    # 1) /plan — бюджет, дни, n, город, форматы, "самые охватные"
+    if _has_any(low, ["план", "спланируй", "на бюджет", "под бюджет", "кампан", "распред", "показы"]):
+        budget = _parse_money(low) or 200_000
+        n = _parse_int(low) or 10
+        days = _parse_int(re.sub(r".*?(\d+)\s*дн", r"\1", low)) or 10
+        city = _extract_city(t) or "Москва"
+        fmts = _extract_formats(low)
+        owners = _extract_owners(t)
+        top = " top=1" if _has_any(low, ["охватн", "самые охватные", "максимальный охват", "coverage"]) else ""
+        fmt_part = f" format={','.join(fmts)}" if fmts else ""
+        own_part = f" owner={','.join(owners)}" if owners else ""
+        cmd = f"/plan budget={int(budget)} city={city} n={n} days={days}{fmt_part}{own_part}{top}"
+        return cmd, "Планирование кампании под бюджет"
+
+    # 2) /pick_city — «подбери/выбери N экранов в <городе> …»
+    if _has_any(low, ["подбери", "выбери", "нужно", "хочу"]) and _has_any(low, ["в ", "по "]):
+        city = _extract_city(t)
+        if city:
+            n = _parse_int(low) or 20
+            fmts = _extract_formats(low)
+            fmt_part = f" format={','.join(fmts)}" if fmts else ""
+            return f"/pick_city {city} {n}{fmt_part}", "Равномерная выборка по городу"
+
+    # 3) /near — «рядом», «около», «в радиусе», координаты, «найди вокруг»
+    latlon = _extract_latlon(t)
+    if latlon or _has_any(low, ["рядом", "около", "в радиусе", "вокруг", "near", "поблизости"]):
+        if latlon:
+            return f"/near {latlon[0]:.6f} {latlon[1]:.6f} 2", "Экраны в радиусе точки (пример на 2 км)"
+        else:
+            return "📍 Пришлите геолокацию или используйте: /near <lat> <lon> 2", "Экраны вокруг вашей точки"
+
+    # 4) /forecast — «сколько показов», «прогноз», «хватает ли бюджета»
+    if _has_any(low, ["сколько показ", "прогноз", "forecast", "хватит ли", "оценка показов"]):
+        budget = _parse_money(low)
+        if budget:
+            return f"/forecast budget={int(budget)} days=7 hours_per_day=8", "Оценка по последней выборке"
+        else:
+            return "/forecast days=7 hours_per_day=8", "Оценка по последней выборке"
+
+    # 5) /sync_api — «обнови список», «подтяни из апи», «синхронизируй»
+    if _has_any(low, ["обнови список", "подтяни из апи", "синхронизируй", "обнови экраны", "sync api"]):
+        fmts = _extract_formats(low)
+        city = _extract_city(t)
+        parts = []
+        if city: parts.append(f"city={city}")
+        if fmts: parts.append(f"formats={','.join(fmts)}")
+        base = " /sync_api " + " ".join(parts) if parts else " /sync_api size=500 pages=3"
+        return base.strip(), "Синхронизация инвентаря из API"
+
+    # 6) /shots — фотоотчёт по кампании
+    if _has_any(low, ["фотоотчет", "фото отчёт", "кадры кампании", "impression", "shots"]):
+        camp = _parse_int(low) or 0
+        if camp > 0:
+            return f"/shots campaign={camp} per=0 limit=100", "Фотоотчет по кампании"
+        else:
+            return "/shots campaign=<ID> per=0 limit=100", "Фотоотчет: укажите campaign ID"
+
+    # 7) /export_last
+    if _has_any(low, ["выгрузи", "экспорт", "csv", "xlsx", "таблица"]):
+        return "/export_last", "Экспорт последней выборки"
+
+    # 8) /radius
+    if _has_any(low, ["радиус", "поставь радиус", "изменить радиус"]):
+        r = _parse_int(low) or 2
+        return f"/radius {r}", "Задать радиус по умолчанию (км)"
+
+    # 9) /status /help
+    if _has_any(low, ["статус", "что загружено", "сколько экранов"]):
+        return "/status", "Статус загруженных данных"
+    if _has_any(low, ["help", "помощ", "что умеешь", "команды"]):
+        return "/help", "Справка по командам"
+
+    # Не нашли понятного соответствия
+    return None, "Похоже, готовой команды для этого нет. Напишите, пожалуйста, @enterspring — он поможет добавить нужную функцию."
+
+
 
 # ---------- базовые команды ----------
 @router.message(Command("start"))
 async def start_cmd(m: Message):
     status = f"Экранов загружено: {len(SCREENS)}." if (SCREENS is not None and not SCREENS.empty) else "Экранов ещё нет — пришлите CSV/XLSX."
     await m.answer(
-        "👋 Привет! Я готов помочь с подбором экранов.\n"
+        "Привет! 💖 Я готова помочь с подбором экранов.\n"
         f"{status}\n\n"
-        "▶️ Нажмите /help, чтобы увидеть примеры команд.",
+        "▶️ Нажми /help, чтобы увидеть примеры команд.",
         reply_markup=make_main_menu()
     )
 
