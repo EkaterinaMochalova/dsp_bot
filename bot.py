@@ -896,11 +896,20 @@ def _extract_formats(text: str) -> list[str]:
     return out
 
 def _extract_owners(text: str) -> list[str]:
-    m = re.search(r"(?:owner|владелец|оператор)[=: ]+([^\n,;]+)", text or "", flags=re.IGNORECASE)
+    t = (text or "")
+    # ловим owner=..., а также «владелец(a/u) <слова>» и «оператор <слова>»
+    m = re.search(r"(?:owner|владелец|владельц[ау]|оператор)\s*[:=]?\s*([A-Za-zА-Яа-я0-9_\-\s,;|]+)", t, flags=re.IGNORECASE)
     if not m:
         return []
-    vals = re.split(r"[;,\| ]+", m.group(1).strip())
-    return [v for v in vals if v]
+    vals = re.split(r"[;,\|]\s*|\s+", m.group(1).strip())
+    vals = [v for v in vals if v and not v.isdigit()]
+    # срежем возможные хвосты после следующего параметра
+    cleaned = []
+    for v in vals:
+        if v.lower() in {"format", "city", "days", "n", "budget", "hours", "hours_per_day"}:
+            break
+        cleaned.append(v)
+    return cleaned
 
 def suggest_command_from_text(text: str) -> tuple[str | None, str]:
     t = (text or "").strip()
