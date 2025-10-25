@@ -19,36 +19,59 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile  # для отправки файлов из памяти
 
-# ==== вверху файла один раз ====
+# ==== КЭШ ИНВЕНТАРЯ: максимально надёжный вариант через /tmp ====
 import os, json, time, logging
 from pathlib import Path
 import pandas as pd
 
+# /tmp на Railway точно доступен на запись. Можно заменить на Volume позже (например, /data).
 BASE_DIR = Path(__file__).resolve().parent
-CACHE_DIR = BASE_DIR / "data"
+CACHE_DIR = Path(os.getenv("SCREENS_CACHE_DIR", "/tmp/omnika_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 CACHE_CSV  = CACHE_DIR / "screens_cache.csv"
 CACHE_META = CACHE_DIR / "screens_cache.meta.json"
 
-def save_screens_cache(df: pd.DataFrame):
-    """Сохраняет кэш на диск (CSV + meta). Возвращает True/False."""
+def _cache_diag() -> str:
+    """Строка-диагностика для логов/ответа: где пишем и есть ли права."""
+    try:
+        can_write_dir = os.access(CACHE_DIR, os.W_OK)
+        parent = CACHE_DIR.parent
+        return (
+            f"BASE_DIR={BASE_DIR} | CACHE_DIR={CACHE_DIR} "
+            f"| exists={CACHE_DIR.exists()} | writable={can_write_dir} "
+            f"| parent_writable={os.access(parent, os.W_OK)}"
+        )
+    except Exception as e:
+        return f"diag_error={e}"
+
+def save_screens_cache(df: pd.DataFrame) -> bool:
+    """Сохраняет кэш на диск (CSV + meta). Возвращает True/False. Супер-диагностика."""
     global LAST_SYNC_TS
     try:
         if df is None or df.empty:
+            logging.warning("save_screens_cache: пустой df — сохранять нечего")
             return False
 
-        # только CSV
+        # пробуем тестовую запись «маячка», чтобы понять права
+        try:
+            (CACHE_DIR / ".write_test").write_text("ok", encoding="utf-8")
+        except Exception as e:
+            logging.error(f"write_test failed: {e} | {_cache_diag()}")
+            return False
+
+        # сохраняем CSV
         df.to_csv(CACHE_CSV, index=False, encoding="utf-8-sig")
 
+        # мета
         LAST_SYNC_TS = time.time()
         meta = {"ts": LAST_SYNC_TS, "rows": int(len(df))}
         CACHE_META.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        logging.info(f"💾 Кэш сохранён: {len(df)} строк → {CACHE_CSV}")
+        logging.info(f"💾 Кэш сохранён: {len(df)} строк → {CACHE_CSV} | {_cache_diag()}")
         return True
     except Exception as e:
-        logging.error(f"Ошибка при сохранении кэша: {e}")
+        logging.error(f"Ошибка при сохранении кэша: {e} | {_cache_diag()}", exc_info=True)
         return False
 
 def load_screens_cache() -> bool:
@@ -56,10 +79,14 @@ def load_screens_cache() -> bool:
     global SCREENS, LAST_SYNC_TS
     try:
         if not CACHE_CSV.exists():
+            logging.info(f"Кэш CSV не найден: {CACHE_CSV} | {_cache_diag()}")
             return False
+
         df = pd.read_csv(CACHE_CSV)
         if df is None or df.empty:
+            logging.warning(f"Кэш CSV пустой: {CACHE_CSV}")
             return False
+
         SCREENS = df
 
         if CACHE_META.exists():
@@ -68,12 +95,28 @@ def load_screens_cache() -> bool:
         else:
             LAST_SYNC_TS = None
 
-        logging.info(f"Loaded screens cache: {len(SCREENS)} rows, ts={LAST_SYNC_TS}")
+        logging.info(f"Loaded screens cache: {len(SCREENS)} rows, ts={LAST_SYNC_TS} | {_cache_diag()}")
         return True
     except Exception as e:
-        logging.error(f"Ошибка при загрузке кэша: {e}")
+        logging.error(f"Ошибка при загрузке кэша: {e} | {_cache_diag()}", exc_info=True)
         return False
 
+from aiogram.filters import Command
+from aiogram import types
+
+@dp.message(Command("cache_info"))
+async def cache_info(m: types.Message):
+    try:
+        lines = [
+            f"CACHE_DIR: {CACHE_DIR}",
+            f"exists: {CACHE_DIR.exists()}",
+            f"writable: {os.access(CACHE_DIR, os.W_OK)}",
+            f"CACHE_CSV exists: {CACHE_CSV.exists()}",
+            f"CACHE_META exists: {CACHE_META.exists()}",
+        ]
+        await m.answer("\n".join(lines))
+    except Exception as e:
+        await m.answer(f"cache_info error: {e}")
 
 def _ssl_ctx_certifi() -> ssl.SSLContext:
     """Создаёт безопасный SSL-контекст с CA из certifi, если доступен."""
