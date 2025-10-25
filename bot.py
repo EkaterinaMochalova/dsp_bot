@@ -2169,9 +2169,194 @@ async def cmd_start(m: types.Message):
         "▶️ Нажмите /help, чтобы увидеть примеры команд.",
         reply_markup=make_main_menu()
     )
-@dp.message(Command("sync_api"))
+# ====== imports ======
+import os, io, math, asyncio, logging, time, json, ssl
+from pathlib import Path
+from datetime import datetime
+import random
+import pandas as pd
+import aiohttp
+
+try:
+    import certifi  # опционально
+except Exception:
+    certifi = None
+
+# aiogram 3.x
+from aiogram import Bot, Dispatcher, F, types, Router
+from aiogram.types import Message, BufferedInputFile, BotCommand
+from aiogram.filters import Command
+
+# ====== logging ======
+logging.basicConfig(level=logging.INFO)
+
+# ====== SSL helpers ======
+def _ssl_ctx_certifi() -> ssl.SSLContext:
+    """Создаёт безопасный SSL-контекст с CA из certifi, если доступен."""
+    if certifi is not None:
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    else:
+        ctx = ssl.create_default_context()
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+def _make_ssl_param_for_aiohttp():
+    """
+    Возвращает параметр для aiohttp ssl=...
+    Если OBDSP_SSL_NO_VERIFY=1, отключает проверку сертификата (на свой страх и риск).
+    """
+    no_verify = os.getenv("OBDSP_SSL_NO_VERIFY", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if no_verify:
+        return False
+    return _ssl_ctx_certifi()
+
+# ====== ENV CONFIG ======
+OBDSP_BASE = os.getenv("OBDSP_BASE", "https://obdsp.projects.eraga.net").strip()
+OBDSP_TOKEN = os.getenv("OBDSP_TOKEN", "").strip()
+OBDSP_AUTH_SCHEME = os.getenv("OBDSP_AUTH_SCHEME", "Bearer").strip()
+OBDSP_CLIENT_ID = os.getenv("OBDSP_CLIENT_ID", "").strip()
+
+try:
+    TELEGRAM_OWNER_ID = int(os.getenv("TELEGRAM_OWNER_ID", "0"))
+except Exception:
+    TELEGRAM_OWNER_ID = 0
+
+OBDSP_CA_BUNDLE = os.getenv("OBDSP_CA_BUNDLE", "").strip()
+OBDSP_SSL_VERIFY = (os.getenv("OBDSP_SSL_VERIFY", "1") or "1").strip().lower()  # "1"/"0"/"true"/"false"
+OBDSP_SSL_NO_VERIFY = os.getenv("OBDSP_SSL_NO_VERIFY", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+# ====== PATHS & STATE ======
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# ЕДИНЫЙ кэш-каталог (можно переопределить env-переменной)
+CACHE_DIR = Path(os.getenv("SCREENS_CACHE_DIR", "/tmp/omnika_cache"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+CACHE_CSV  = CACHE_DIR / "screens_cache.csv"
+CACHE_META = CACHE_DIR / "screens_cache.meta.json"
+
+SCREENS: pd.DataFrame | None = None
+LAST_RESULT: pd.DataFrame | None = None
+LAST_SELECTION_NAME = "last"
+MAX_PLAYS_PER_HOUR = 6
+LAST_SYNC_TS: float | None = None
+
+def _cache_diag() -> str:
+    """Строка-диагностика для логов/ответа: где пишем и есть ли права."""
+    try:
+        can_write_dir = os.access(CACHE_DIR, os.W_OK)
+        parent = CACHE_DIR.parent
+        return (
+            f"BASE_DIR={BASE_DIR} | CACHE_DIR={CACHE_DIR} "
+            f"| exists={CACHE_DIR.exists()} | writable={can_write_dir} "
+            f"| parent_writable={os.access(parent, os.W_OK)}"
+        )
+    except Exception as e:
+        return f"diag_error={e}"
+
+def save_screens_cache(df: pd.DataFrame) -> bool:
+    """Сохраняет кэш на диск (CSV + meta)."""
+    global LAST_SYNC_TS
+    try:
+        if df is None or df.empty:
+            logging.warning("save_screens_cache: пустой df — сохранять нечего")
+            return False
+
+        # тест записи
+        try:
+            (CACHE_DIR / ".write_test").write_text("ok", encoding="utf-8")
+        except Exception as e:
+            logging.error(f"write_test failed: {e} | {_cache_diag()}")
+            return False
+
+        df.to_csv(CACHE_CSV, index=False, encoding="utf-8-sig")
+
+        LAST_SYNC_TS = time.time()
+        meta = {"ts": LAST_SYNC_TS, "rows": int(len(df))}
+        CACHE_META.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        logging.info(f"💾 Кэш сохранён: {len(df)} строк → {CACHE_CSV} | {_cache_diag()}")
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка при сохранении кэша: {e} | {_cache_diag()}", exc_info=True)
+        return False
+
+def load_screens_cache() -> bool:
+    """Пытается поднять инвентарь из CSV. Возвращает True/False."""
+    global SCREENS, LAST_SYNC_TS
+    try:
+        if not CACHE_CSV.exists():
+            logging.info(f"Кэш CSV не найден: {CACHE_CSV} | {_cache_diag()}")
+            return False
+
+        df = pd.read_csv(CACHE_CSV)
+        if df is None or df.empty:
+            logging.warning(f"Кэш CSV пустой: {CACHE_CSV}")
+            return False
+
+        SCREENS = df
+
+        if CACHE_META.exists():
+            meta = json.loads(CACHE_META.read_text(encoding="utf-8"))
+            LAST_SYNC_TS = float(meta.get("ts")) if "ts" in meta else None
+        else:
+            LAST_SYNC_TS = None
+
+        logging.info(f"Loaded screens cache: {len(SCREENS)} rows, ts={LAST_SYNC_TS} | {_cache_diag()}")
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка при загрузке кэша: {e} | {_cache_diag()}", exc_info=True)
+        return False
+
+# ====== BOT (aiogram 3.x) ======
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise SystemExit("Set BOT_TOKEN env var first")
+
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+router = Router()
+
+# ---------- базовые команды ----------
+@router.message(Command("start"))
+async def start_cmd(m: Message):
+    await m.answer("Я на месте. Доступно: /cache_info, /sync_api")
+
+@router.message(Command("ping"))
+async def ping_cmd(m: Message):
+    await m.answer("pong")
+
+# ---------- диагностика кэша ----------
+@router.message(Command("cache_info"))
+async def cache_info(m: Message):
+    try:
+        lines = [
+            f"CACHE_DIR: {CACHE_DIR}",
+            f"exists: {CACHE_DIR.exists()}",
+            f"writable: {os.access(CACHE_DIR, os.W_OK)}",
+            f"CACHE_CSV exists: {CACHE_CSV.exists()}",
+            f"CACHE_META exists: {CACHE_META.exists()}",
+            f"diag: {_cache_diag()}",
+        ]
+        await m.answer("\n".join(lines))
+    except Exception as e:
+        await m.answer(f"cache_info error: {e}")
+
+# дублирующий матчинг для групп/упоминаний
+@router.message(F.text.func(lambda t: isinstance(t, str) and t.strip().startswith(("/cache_info", "/cache_info@"))))
+async def cache_info_fallback(m: Message):
+    await cache_info(m)
+
+# ---------- СИНХРОНИЗАЦИЯ ИНВЕНТАРЯ ИЗ API ----------
+# ВНИМАНИЕ: ниже используются твои функции _owner_only, _fetch_inventories, _normalize_api_to_df
+# (они должны быть определены ниже по файлу или импортированы).
+
+@router.message(Command("sync_api"))
 async def cmd_sync_api(m: types.Message):
-    if not _owner_only(m.from_user.id):
+    if not _owner_only(m.from_user.id):  # <- твоя функция
         await m.answer("⛔️ Только владелец бота может выполнять эту команду.")
         return
 
@@ -2185,7 +2370,7 @@ async def cmd_sync_api(m: types.Message):
                 val = p.split("=", 1)[1]
                 try:
                     return cast(val)
-                except:
+                except Exception:
                     return default
         return default
 
@@ -2225,12 +2410,12 @@ async def cmd_sync_api(m: types.Message):
 
     # --- тянем, нормализуем, сохраняем ---
     try:
-        items = await _fetch_inventories(
+        items = await _fetch_inventories(   # <- твоя функция
             pages_limit=pages_limit,
             page_size=page_size,
             total_limit=total_limit,
             m=m,
-            filters=filters,   # ВАЖНО: фильтры уедут прямо в запрос
+            filters=filters,
         )
     except Exception as e:
         logging.exception("sync_api failed")
@@ -2242,7 +2427,7 @@ async def cmd_sync_api(m: types.Message):
         return
 
     # нормализация -> DataFrame
-    df = _normalize_api_to_df(items)   # <--- правильное имя функции
+    df = _normalize_api_to_df(items)  # <- твоя функция
     if df.empty:
         await m.answer("Список пришёл, но после нормализации пусто (проверь маппинг полей).")
         return
@@ -2263,7 +2448,7 @@ async def cmd_sync_api(m: types.Message):
     # --- отправка CSV ---
     try:
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-        await bot.send_document(
+        await m.bot.send_document(
             m.chat.id,
             BufferedInputFile(csv_bytes, filename="inventories_sync.csv"),
             caption=f"Инвентарь из API: {len(df)} строк (CSV)"
@@ -2277,7 +2462,7 @@ async def cmd_sync_api(m: types.Message):
         with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="inventories")
         xlsx_buf.seek(0)
-        await bot.send_document(
+        await m.bot.send_document(
             m.chat.id,
             BufferedInputFile(xlsx_buf.getvalue(), filename="inventories_sync.xlsx"),
             caption=f"Инвентарь из API: {len(df)} строк (XLSX)"
@@ -2287,6 +2472,43 @@ async def cmd_sync_api(m: types.Message):
 
     await m.answer(f"✅ Синхронизация ок: {len(df)} экранов.")
 
+# Фоллбек-матчинг по «сырому» тексту (группы/упоминания)
+@router.message(F.text.func(lambda t: isinstance(t, str) and t.strip().startswith(("/sync_api", "/sync_api@"))))
+async def cmd_sync_api_fallback(m: types.Message):
+    await cmd_sync_api(m)
+
+# Логгирование прочего (чтобы понимать, что ещё прилетает)
+@router.message()
+async def _log_unhandled_messages(m: types.Message):
+    logging.info(f"Unhandled message caught by router: "
+                 f"type={m.content_type}, chat={m.chat.type}, text={getattr(m, 'text', None)!r}")
+
+@router.chat_member()
+async def _log_chat_member(ev: types.ChatMemberUpdated):
+    logging.info(f"ChatMember update: chat={ev.chat.id}, old={ev.old_chat_member.status}, new={ev.new_chat_member.status}")
+
+# ---------- регистрация роутера и запуск ----------
+dp.include_router(router)
+
+async def main():
+    # пробуем поднять кэш на старте (не критично)
+    try:
+        load_screens_cache()
+    except Exception as e:
+        logging.warning(f"Не удалось загрузить кэш на старте: {e}")
+
+    # Подсказки команд в интерфейсе Telegram
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Проверка, что бот жив"),
+        BotCommand(command="ping", description="Проверка ответа"),
+        BotCommand(command="cache_info", description="Диагностика кэша"),
+        BotCommand(command="sync_api", description="Синхронизация инвентаря из API"),
+    ])
+
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 @dp.message(Command("shots"))
 async def cmd_shots(m: types.Message):
