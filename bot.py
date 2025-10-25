@@ -1093,7 +1093,7 @@ async def cmd_geo(m: types.Message):
         limit = int(kv.get("limit", "5") or 5)
     except Exception:
         limit = 5
-    provider = kv.get("provider", "nominatim").lower()
+    provider = (kv.get("provider") or "nominatim").lower()
 
     await m.answer(f"🔎 Ищу точки по запросу «{query}»" + (f" в городе {city}" if city else "") + "…")
 
@@ -1103,36 +1103,73 @@ async def cmd_geo(m: types.Message):
     except Exception as e:
         await m.answer(f"⚠️ Геокодер {provider} вернул ошибку: {e}. Пробую альтернативу…")
 
-    # fallback на OpenAI — если базовые геокодеры не нашли или вернули пусто
+    # fallback на OpenAI — если ничего не нашли/ошибка
     if not pois:
-        await m.answer("🧠 Пробую найти через OpenAI…")
         try:
+            await m.answer("🧠 Пробую найти через OpenAI…")
             ai_pois = await find_poi_ai(query=query, city=city, limit=limit, country_hint="Россия")
-        except Exception as e:
+        except Exception:
             ai_pois = []
         if ai_pois:
-            # привести к единому формату (name, lat, lon, provider, address?)
             pois = [{
                 "name": p.get("name", ""),
-                "lat": p.get("lat"),
-                "lon": p.get("lon"),
+                "lat": float(p["lat"]) if p.get("lat") is not None else None,
+                "lon": float(p["lon"]) if p.get("lon") is not None else None,
                 "provider": p.get("provider", "openai"),
                 "address": p.get("address", "")
-            } for p in ai_pois]
+            } for p in ai_pois if p.get("lat") is not None and p.get("lon") is not None]
 
     if not pois:
-        await m.answer("Ничего не нашёл. Попробуйте уточнить запрос или сменить provider.")
+        await m.answer("Ничего не нашёл. Попробуйте уточнить запрос, увеличить limit или сменить provider.")
         return
 
     LAST_POI = pois
+
+    # Собираем человекочитаемые строки и не превышаем лимит Telegram
     lines = []
     for i, p in enumerate(pois, 1):
-        addr = p.get("address") or ""
-        pr = p.get("provider", "")
-        lines.append(
-            f"{i}. {p['name']}" + (f", {addr}" if addr else "") + f"\n   [{p['lat']:.6f}, {p['lon']:.6f}] ({pr})"
+        addr = (p.get("address") or "").strip()
+        prov = p.get("provider", "")
+        try:
+            lat_s = f"{float(p['lat']):.6f}"
+            lon_s = f"{float(p['lon']):.6f}"
+        except Exception:
+            lat_s = str(p.get("lat", ""))
+            lon_s = str(p.get("lon", ""))
+        line = f"{i}. {p.get('name','')}" + (f", {addr}" if addr else "") + f"\n   [{lat_s}, {lon_s}] ({prov})"
+        lines.append(line)
+
+    # В чат — ограниченное число строк + разбиение на пачки
+    to_show = lines[:100]
+    header = (
+        f"📍 Найденные точки: всего {len(pois)}\n"
+        f"(показано {len(to_show)}; полный список — в CSV)\n\n"
+        "Теперь можно: /near_geo 2  — подобрать экраны рядом"
+    )
+    await send_lines(m, to_show, header=header, chunk=40)
+
+    # Отправим полный CSV со всеми POI
+    try:
+        import io as _io, csv as _csv
+        buf = _io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(["name", "address", "lat", "lon", "provider"])
+        for p in pois:
+            w.writerow([
+                p.get("name",""),
+                p.get("address",""),
+                p.get("lat",""),
+                p.get("lon",""),
+                p.get("provider",""),
+            ])
+        csv_bytes = buf.getvalue().encode("utf-8-sig")
+        await bot.send_document(
+            m.chat.id,
+            types.BufferedInputFile(csv_bytes, filename="geo_pois.csv"),
+            caption=f"Все найденные точки: {len(pois)} (CSV)"
         )
-    await m.answer("📍 Найденные точки:\n\n" + "\n".join(lines) + "\n\nТеперь можно: /near_geo 2  — подобрать экраны рядом")
+    except Exception as e:
+        await m.answer(f"⚠️ Не удалось отправить CSV с точками: {e}")
 
 # ---------- /near_geo (в том же geo_router) ----------
 @geo_router.message(Command("near_geo"))
