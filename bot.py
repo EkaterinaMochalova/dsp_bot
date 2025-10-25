@@ -997,16 +997,30 @@ def suggest_command_from_text(text: str) -> tuple[str | None, str]:
 async def natural_language_assistant(m: types.Message):
     text = (m.text or "").strip()
     cmd, hint = suggest_command_from_text(text)
+
+    # Экран безо всяких сюрпризов для HTML
+    hint_safe = hd.quote(hint or "")
+
     if cmd:
-        await m.answer(
-            f"Почти уверена, что вам нужна команда</b> 👉 <code>{cmd}</code>\n\n<i>{hd.quote(hint)}</i>",
-            parse_mode="HTML"
-        )
+        cmd_safe = hd.quote(cmd.strip())
+        # Если это настоящая команда — показываем в <code>, иначе просто текстом (но экранированным)
+        if cmd.strip().startswith("/"):
+            body = (
+                "Похоже, сработает команда</b> 👉 <code>{cmd_safe}</code>\n\n"
+                f"<i>{hint_safe}</i>"
+            )
+        else:
+            body = (
+                "Похоже, вы хотите это:\n\n"
+                f"{cmd_safe}\n\n"
+                f"<i>{hint_safe}</i>"
+            )
+        await m.answer(body, parse_mode="HTML", disable_web_page_preview=True)
     else:
         await m.answer(
-            f"{hd.quote('Похоже, готовой команды для этого нет. Напишите, пожалуйста, @enterspring — она поможет добавить нужную функцию.')}\n\n"
-            "А пока можно посмотреть доступные команды: /help",
-            parse_mode="HTML"
+            f"{hint_safe}\n\nА пока можно посмотреть доступные команды: /help",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
 
 # Подключение NLU-роутера ДОЛЖНО быть выше, чем основной:
