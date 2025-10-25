@@ -920,17 +920,28 @@ def suggest_command_from_text(text: str) -> tuple[str | None, str]:
         cmd = f"/plan budget={int(budget)} city={city} n={n} days={days}{fmt_part}{own_part}{top}"
         return cmd, "Планирование кампании под бюджет"
 
-    # /pick_city — выборка по городу (БЕЗ предлога!)
+    # /pick_city — выборка по городу (учитываем format и owner)
     if _has_any(low, ["подбери", "выбери", "нужно", "хочу"]) and _has_any(low, ["в ", "по ", "из "]):
         city = _extract_city(t)
         if city:
             n = _parse_int(low) or 20
             fmts = _extract_formats(low)
+            owners = _extract_owners(t)
             fmt_part = f" format={','.join(fmts)}" if fmts else ""
-            return f"/pick_city {city} {n}{fmt_part}", "Равномерная выборка по городу"
+            own_part = f" owner={','.join(owners)}" if owners else ""
+            cmd = f"/pick_city {city} {n}{fmt_part}{own_part}"
+            return cmd.strip(), "Равномерная выборка по городу"
 
-    # /near — рядом/в радиусе
+    # /pick_at — равномерная выборка внутри круга (если есть координаты и указан N)
     latlon = _extract_latlon(t)
+    if latlon and _has_any(low, ["подбери", "выбери", "хочу", "нужно"]):
+        n = _parse_int(low) or 20
+        # радиус: попытаемся вытащить «15 км», иначе по умолчанию 15
+        m_r = re.search(r"(\d+)\s*(?:км|km)", low)
+        radius = int(m_r.group(1)) if m_r else 15
+        return f"/pick_at {latlon[0]:.6f} {latlon[1]:.6f} {n} {radius}", "Равномерная выборка в круге"
+
+    # /near — посмотреть экраны вокруг точки
     if latlon or _has_any(low, ["рядом", "около", "в радиусе", "вокруг", "near", "поблизости"]):
         if latlon:
             return f"/near {latlon[0]:.6f} {latlon[1]:.6f} 2", "Экраны в радиусе точки (пример на 2 км)"
@@ -988,7 +999,7 @@ async def natural_language_assistant(m: types.Message):
     cmd, hint = suggest_command_from_text(text)
     if cmd:
         await m.answer(
-            f"Похоже, вы хотите это:\n\n<b>Советую команду</b> 👉 <code>{cmd}</code>\n\n<i>{hd.quote(hint)}</i>",
+            f"Почти уверена, что вам нужна команда</b> 👉 <code>{cmd}</code>\n\n<i>{hd.quote(hint)}</i>",
             parse_mode="HTML"
         )
     else:
