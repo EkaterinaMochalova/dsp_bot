@@ -8,34 +8,494 @@ import time, json
 import typing
 import numpy as np
 import aiohttp, io, re, pandas as pd
-from aiogram.filters import Command
 from aiogram.types import BufferedInputFile
+from aiogram import Router, F, types
+from aiogram.filters import Command, CommandStart
+from aiogram.enums import ChatAction
 
+import os
+from dotenv import load_dotenv
+load_dotenv()
 
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 import os
 import json
+import logging, re
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+
+from aiogram import Bot, Dispatcher, types, F
+
+# --- нормализация городов ---
+CITY_MAP = {
+    # Москва
+    "москва": "Москва", "в москве": "Москва", "по москве": "Москва",
+    # Санкт-Петербург
+    "санкт-петербург": "Санкт-Петербург", "санкт петербург": "Санкт-Петербург",
+    "петербург": "Санкт-Петербург", "спб": "Санкт-Петербург",
+    "в петербурге": "Санкт-Петербург", "по петербургу": "Санкт-Петербург",
+    # Казань
+    "казань": "Казань", "в казани": "Казань", "по казани": "Казань",
+    # при необходимости дополняй сюда другие ключи
+}
+
+def _normalize_city(text: str) -> str | None:
+    t = re.sub(r"\s+", " ", text.strip().lower())
+    return CITY_MAP.get(t)
+
+# --- нормализация форматов ---
+FORMAT_MAP = {
+    # билборды
+    "билборд": "BILLBOARD", "билборды": "BILLBOARD", "билбордов": "BILLBOARD",
+    "billboard": "BILLBOARD",
+    # суперсайты
+    "суперсайт": "SUPERSITE", "суперсайты": "SUPERSITE", "суперсайтов": "SUPERSITE",
+    "supersite": "SUPERSITE",
+    # медифасады
+    "медиафасад": "MEDIAFACADE", "медиафасады": "MEDIAFACADE", "медиафасадов": "MEDIAFACADE",
+    "mediafacade": "MEDIAFACADE",
+    # ситиборды (на всякий)
+    "ситиборд": "CITYBOARD", "ситиборды": "CITYBOARD", "ситибордов": "CITYBOARD",
+    "cityboard": "CITYBOARD",
+}
+
+# ——— эвристика «похоже на подбор/план?» ———
+_PICK_HINT_RE = re.compile(r'\b(подбери|подбор|выбери|собери)\b', re.IGNORECASE)
+_PLAN_HINT_RE = re.compile(r'\b(план|расписание|график)\b', re.IGNORECASE)
+
+def _looks_like_pick_or_plan(text: str) -> bool:
+    t = (text or "").strip()
+    return bool(_PICK_HINT_RE.search(t) or _PLAN_HINT_RE.search(t))
+
+
+def _extract_formats(lower_text: str) -> list[str]:
+    found = []
+    # соберём все слова, которые мы знаем, включая «и», «/», «,»
+    tokens = re.split(r"[^\w\-а-яё]+", lower_text, flags=re.IGNORECASE)
+    for tok in tokens:
+        if not tok:
+            continue
+        fmt = FORMAT_MAP.get(tok)
+        if fmt and fmt not in found:
+            found.append(fmt)
+    return found
+
+# ---- NL parser: "подбери 30 билбордов и суперсайтов в Москве равномерно" ----
 import re
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-_openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-from openai import OpenAI
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+def parse_pick_city_nl(text: str) -> dict:
+    """
+    Возвращает: {"city": str|None, "n": int|None, "formats": [str], "even": bool}
+    Понимает:
+      - кол-во: 10, 30, 100 ...
+      - форматы: билборд(ы), суперсайт(ы), ситиборд/ситиформат, медиафасад
+      - город после "в" или "по": 'в Москве', 'по Санкт-Петербургу'
+      - флаг "равномерно"
+    """
+    s = (text or "").strip()
+    s_sp = " ".join(s.split())  # нормализуем пробелы
+    s_low = s_sp.lower()
 
-def chat_with_openai(prompt):
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "Ты дружелюбный помощник по имени Омника, который говорит с лёгким юмором и интересуется пользователем. Отвечай естественно, коротко, но тепло."},
-            {"role": "user", "content": prompt}
+    # 1) n (количество)
+    n = None
+    m_n = re.search(r"\b(\d{1,4})\b", s_low)
+    if m_n:
+        try:
+            n = int(m_n.group(1))
+        except Exception:
+            n = None
+
+    # 2) formats
+    # словарь ключевых слов -> кодов форматов
+    fmt_map = {
+        r"\bбилборд\w*": "BILLBOARD",
+        r"\bsuper\s*site\w*": "SUPERSITE",
+        r"\bсуперсайт\w*": "SUPERSITE",
+        r"\bситиборд\w*": "CITYBOARD",
+        r"\bситиформат\w*": "CITYBOARD",
+        r"\bмедиафасад\w*": "MEDIAFACADE",
+        r"\bmedia\s*facade\w*": "MEDIAFACADE",
+        r"\bэкран\w*": "SCREEN",
+    }
+    formats = []
+    for pat, code in fmt_map.items():
+        if re.search(pat, s_low, flags=re.I):
+            if code not in formats:
+                formats.append(code)
+
+    # 3) even (равномерно)
+    even = bool(re.search(r"\bравномерн\w*\b|\beven\b", s_low, flags=re.I))
+
+    # 4) city
+    # Ищем после "в" или "по" до выключающих слов (равномерно/форматы/конец)
+    # Примеры: "в москве", "по санкт-петербургу", "в нижнем новгороде"
+    # Сначала уберём хвост типа "равномерно" чтобы не мешал
+    s_no_even = re.sub(r"\bравномерн\w*\b|\beven\b", "", s_sp, flags=re.I).strip()
+
+    # Регекс: (в|по) <название...> (до конца строки)
+    m_city = re.search(r"(?:\bв\b|\bпо\b)\s+([A-Za-zА-Яа-яЁё\-\s]+)$", s_no_even, flags=re.I)
+    city = None
+    if m_city:
+        raw_city = m_city.group(1).strip()
+
+        # иногда в середину города «прилипает» мусор до предлога "в/по".
+        # На всякий случай вырежем наиболее частый шум форматов, если попал:
+        raw_city = re.sub(r"\b(и|и\s+суперсайтов|и\s+билбордов|суперсайтов|билбордов)\b", "", raw_city, flags=re.I).strip()
+
+        # нормализуем регистр: Санкт-Петербург, Нижний Новгород, т.п.
+        def smart_title(x: str) -> str:
+            parts = [p.capitalize() for p in re.split(r"(\s|-)", x)]
+            return "".join(parts).replace(" - ", "-")
+
+        city = smart_title(raw_city)
+
+        # спец-фиксы склонений
+        city = re.sub(r"\bМоскв[аеы]\b", "Москва", city)
+        city = re.sub(r"\bСанкт[- ]Петербург\w*\b", "Санкт-Петербург", city)
+        city = re.sub(r"\bНижн\w*\s+Новгород\w*\b", "Нижний Новгород", city)
+        city = re.sub(r"\bРостов[- ]на[- ]Дону\w*\b", "Ростов-на-Дону", city)
+        city = re.sub(r"\bКазань\w*\b", "Казань", city)
+
+    return {
+        "city": city,
+        "n": n,
+        "formats": formats,
+        "even": even,
+    }
+
+
+# ==== РОУТЕР ДЛЯ ЕСТЕСТВЕННЫХ ЗАПРОСОВ ====
+from aiogram import Router, F
+from aiogram import types
+
+intents_router = Router(name="intents")
+
+ASK_PATTERN = re.compile(r"^\s*(/ask\b|подбери\b|план\b)", re.IGNORECASE)
+
+@intents_router.message(
+    F.text
+    & ~F.text.startswith("/")                       # не ловим системные команды
+    & F.text.func(lambda t: ASK_PATTERN.search(t))  # «подбери», «план», «/ask …»
+)
+async def handle_natural_ask(m: types.Message):
+    text  = m.text or ""
+    query = text.strip()
+
+    # --- 1) Подбор (pick_city) ---
+    nl_pick = parse_pick_city_nl(query)
+    if nl_pick.get("city") and nl_pick.get("n"):
+        city    = nl_pick["city"]
+        n       = nl_pick["n"]
+        formats = nl_pick.get("formats") or []
+        even    = bool(nl_pick.get("even"))
+
+        preview = ["/pick_city", city, str(n)]
+        if formats:
+            preview.append("format=" + ",".join(formats))
+        if even:
+            preview.append("fixed=1")
+        await m.answer("Сделаю так: " + " ".join(preview))
+
+        return await pick_city(m, _call_args={
+            "city":    city,
+            "n":       n,
+            "formats": formats,   # например ["BILLBOARD","SUPERSITE"]
+            "owners":  [],
+            "fields":  [],
+            "shuffle": False,
+            "fixed":   even,
+            "seed":    42 if even else None,
+        })
+
+    # --- 2) План (plan) ---
+    nl_plan = parse_plan_nl(query)
+    if nl_plan.get("cities"):
+        fmt   = nl_plan.get("format")
+        days  = nl_plan.get("days")  or 7
+        hours = nl_plan.get("hours") or 12
+        formats_req = [fmt] if fmt else []
+        parts = ["/plan", "города=" + ";".join(nl_plan["cities"])]
+        if formats_req: parts.append("format=" + ",".join(formats_req))
+        parts += [f"days={days}", f"hours={hours}", "mode=even", "rank=ots"]
+        await m.answer("Поняла запрос как: " + " ".join(parts))
+
+        return await _plan_core(
+            m,
+            cities=nl_plan["cities"],
+            days=days,
+            hours=hours,
+            formats_req=formats_req,
+            max_per_city=None,
+            max_total=None,
+            budget_total=None,
+            mode="even",
+            rank="ots",
+        )
+
+    # --- 3) Фолбэк (если не распарсили как ask/план) ---
+    await m.answer(
+        "Пока понимаю два типа запросов:\n"
+        "• Подбор: «подбери 100 билбордов и суперсайтов по Петербургу»\n"
+        "• План: «план на неделю по ситибордам в Ростове, 12 часов в день»"
+    )
+
+dp = Dispatcher(storage=MemoryStorage())
+
+# === РОУТЕР UX (объяви один раз, до хендлеров) ===
+ux_router = Router(name="humanize")
+ux_router.message.filter(F.chat.type == "private")
+
+# === Подписи кнопок и клавиатуры ===
+BTN_UPLOAD = "📂 Как загрузить CSV/XLSX"
+BTN_PICK_CITY = "🎯 Подбор по городу"
+BTN_PICK_ANY  = "🌍 По всей стране"
+BTN_NEAR      = "📌 В радиусе"
+BTN_FORECAST  = "🧮 Прогноз /forecast"
+BTN_STATUS    = "ℹ️ /status"
+BTN_HELP      = "❓ /help"
+BTN_ASK       = "💬 /ask"
+
+BUTTON_TEXTS = {
+    BTN_UPLOAD, BTN_PICK_CITY, BTN_PICK_ANY, BTN_NEAR,
+    BTN_FORECAST, BTN_STATUS, BTN_HELP, BTN_ASK
+}
+
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+
+def kb_empty() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        keyboard=[
+            [KeyboardButton(text=BTN_UPLOAD)],
+            [KeyboardButton(text=BTN_HELP), KeyboardButton(text=BTN_STATUS)],
+            [KeyboardButton(text=BTN_ASK)],
         ]
     )
-    return response.choices[0].message.content
 
-conversation = [
-    {"role": "system", "content": "Ты умный, эмпатичный ассистент, который ведёт непринуждённый диалог."}
-]
+def kb_loaded() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        keyboard=[
+            [KeyboardButton(text=BTN_PICK_CITY),
+             KeyboardButton(text=BTN_PICK_ANY),
+             KeyboardButton(text=BTN_NEAR)],
+            [KeyboardButton(text=BTN_FORECAST),
+             KeyboardButton(text=BTN_STATUS)],
+            [KeyboardButton(text=BTN_ASK),
+             KeyboardButton(text=BTN_HELP)],
+        ]
+    )
+
+# === КНОПОЧНЫЕ ХЕНДЛЕРЫ (должны стоять ВЫШЕ общего F.text) ===
+@ux_router.message(F.text == BTN_UPLOAD)
+async def how_to_upload(m: types.Message):
+    await m.answer(
+        "📂 Загрузка файла:\n"
+        "— Отправь сюда CSV/XLSX с колонками: screen_id, name, lat, lon, city, format, owner, ...\n"
+        "— Я распознаю и включу клавиатуру с действиями.\n"
+        "Подсказка: можно просто перетащить файл в чат."
+    )
+
+@ux_router.message(F.text == BTN_PICK_CITY)
+async def hint_pick_city(m: types.Message):
+    await m.answer(
+        "Пример:\n"
+        "• `/pick_city Москва 20 format=BILLBOARD,SUPERSITE fixed=1 seed=7`\n"
+        "• `/ask подбери 30 билбордов и суперсайтов по Москве равномерно`",
+        parse_mode="Markdown"
+    )
+
+@ux_router.message(F.text == BTN_PICK_ANY)
+async def hint_pick_any(m: types.Message):
+    await m.answer(
+        "Пример:\n"
+        "• `/pick_any 100 format=MEDIAFACADE fixed=1 seed=7`\n"
+        "• `/ask подбери 120 MEDIAFACADE по всей стране`",
+        parse_mode="Markdown"
+    )
+
+@ux_router.message(F.text == BTN_NEAR)
+async def hint_near(m: types.Message):
+    await m.answer(
+        "Пример:\n"
+        "• `/pick_at 55.751 37.618 25 12 format=BILLBOARD`\n"
+        "• `/near 55.751 37.618 3 fields=screen_id`",
+        parse_mode="Markdown"
+    )
+
+@ux_router.message(F.text == BTN_FORECAST)
+async def hint_forecast(m: types.Message):
+    await m.answer(
+        "Пример:\n"
+        "• `/forecast 7d cities=Москва format=BILLBOARD`\n"
+        "• или сначала сделай подбор, а потом запусти `/forecast`",
+        parse_mode="Markdown"
+    )
+
+import re
+from aiogram import Router, F
+from aiogram.types import Message
+
+# --- Интент-роутер ---
+intents_router = Router(name="intents")
+
+# Регулярка для всех "деловых" запросов
+INTENT_RE = re.compile(
+    r"(?i)\b("
+    r"подбери|выбери|собери|подбор|план|расписан|прогноз|forecast|plan|pick_|near|"
+    r"равномерн|по всей стране|по россии|в радиусе|"
+    r"билборд|суперсайт|ситиборд|ситиформат|media\s*facade|mediafacade|экран"
+    r")\b"
+)
+
+@intents_router.message(F.text.regexp(INTENT_RE))
+async def intent_router_entry(m: Message):
+    # перенаправляем такие тексты в /ask-обработчик
+    await _handle_ask_like_text(m, m.text)
+
+# ==== Smalltalk (последний по приоритету) ====
+import re
+from aiogram import F
+from aiogram.types import Message
+from aiogram import Bot
+
+# если ещё нет — задай тексты кнопок и паттерн интентов
+BUTTON_TEXTS = {
+    "📂 Как загрузить CSV/XLSX",
+    "🎯 Подбор по городу",
+    "🌍 По всей стране",
+    "📌 В радиусе",
+    "🧮 Прогноз /forecast",
+    "ℹ️ /status",
+    "💬 /ask",
+    "❓ /help",
+}
+
+# всё, что должно уйти в бизнес-логику (не в болталку)
+INTENT_RE = r"(подбери|собери|выбери|план|расписание|прогноз|forecast|pick_city|pick_any|pick_at|near)\b"
+
+@ux_router.message(F.text)
+async def smalltalk(message: Message, bot: Bot):
+    txt = (message.text or "").strip()
+    if not txt:
+        return
+
+    # 1) не перехватываем команды
+    if txt.startswith("/"):
+        return
+
+    # 2) не трогаем нажатия кнопок (их уже обработали выше)
+    if txt in BUTTON_TEXTS:
+        return
+
+    # 3) если текст похож на бизнес-намерение — передаём в твою логику
+    try:
+        if re.search(INTENT_RE, txt, flags=re.IGNORECASE):
+            handled = await _maybe_handle_intent(message, txt)
+            if handled:
+                return
+    except Exception:
+        # молча даём шанс болталке
+        pass
+
+    # 4) иначе — болталка
+    try:
+        prefs = get_user_prefs(message.from_user.id)
+        await typing(message.chat.id, bot, min(1.0, 0.2 + len(txt) / 100))
+        reply = await smart_reply(txt, prefs.get("name"), prefs.get("style"))
+        await message.answer(style_wrap(reply, prefs.get("style")))
+    except Exception as e:
+        logging.exception("LLM error")
+        await message.answer("Кажется, я задумалась. Попробуешь ещё раз?")
+
+
+# ===== Omnika: системный промпт + smart_reply =====
+from typing import Optional
+import os
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None  # чтобы не падать при импорте, если среда без openai
+
+# 1) Системный промпт (личность, стиль и правила поведения)
+SYSTEM_PROMPT_OMNIKA = """
+Ты — Omnika, дружелюбный помощник платформы Omni360 DSP (DOOH).
+Говоришь естественно и по делу, без официоза и «канцелярита».
+
+Стиль:
+- кратко, тепло, профессионально; лучше показать «как правильно», чем говорить «я не могу».
+- если запрос неоднозначный — уточняй мягко.
+
+Главные правила маршрутизации:
+1) Если пользователь просит подобрать/собрать/выбрать экраны:
+   (билборды, суперсайты, ситиборды/ситиформаты, медиафасады и т.п., упоминает город/города/«по всей стране»)
+   → НЕ подбирай сама. Вежливо подскажи два варианта: отправить ту же фразу с /ask или /pick_city Москва 20 format=BILLBOARD.
+   Пример ответа (шаблон):
+   «Чтобы подобрать экраны, отправь команду:
+    /ask <исходная фраза пользователя без изменений> или /pick_city Москва 20 format=BILLBOARD» 
+
+2) Если просят «план/расписание/прогноз» (например, «план на неделю…»)
+   → Аналогично: «Для этого используй команду:
+      /ask <исходная фраза пользователя> или /forecast budget=2.5m days=7 hours_per_day=10»
+
+3) Если пользователь уже использует /ask — не вмешивайся; эту команду обрабатывает логика бота.
+
+4) Если запрос не про подбор/план:
+   — отвечай как обычный ассистент (поддержать диалог, подсказать где что находится в системе и т.п.).
+
+Запрещено:
+- Выдумывать списки адресов/экранов и технические детали, которых нет в системе.
+- Отвечать «не могу» там, где можно подсказать «как правильно».
+- Писать слишком формально.
+
+Формат ответа:
+- Одна–две короткие фразы. Без лишней воды.
+"""
+
+# 2) Универсальная функция ответа ИИ
+def smart_reply(user_text: str, user_name: Optional[str] = None, style: Optional[str] = None) -> str:
+    """
+    Делает короткий «человечный» ответ по SYSTEM_PROMPT_OMNIKA.
+    Если OpenAI не доступен, возвращает мягкий fallback.
+    """
+    # Небольшая защита: если в тексте уже есть /ask — ничего не навязываем
+    if "/ask" in (user_text or ""):
+        return "Приняла. Команда /ask обработается системой."
+
+    # Попытка позвать OpenAI
+    try:
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        # Используем уже инициализированного клиента, если он у тебя называется _openai_client
+        client = globals().get("_openai_client") or OpenAI()
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_OMNIKA},
+            {"role": "user",   "content": user_text or ""},
+        ]
+
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.4,
+            max_tokens=400,
+        )
+        return (resp.choices[0].message.content or "").strip()
+
+    except Exception:
+        # Fallback без ИИ (на всякий случай)
+        txt = (user_text or "").lower()
+        trigger_words = [
+            "подбери", "собери", "выбери",
+            "билборд", "суперсайт", "ситиборд", "ситиформат", "mediafacade", "медиафасад",
+            "экраны", "наружка", "outdoor", "dooh"
+        ]
+        if any(w in txt for w in trigger_words):
+            return f"Чтобы подобрать экраны, отправь команду:\n/ask {user_text.strip()}"
+        if any(w in txt for w in ["план", "расписание", "прогноз"]):
+            return f"Для плана используй:\n/ask {user_text.strip()}"
+        return "Готова помочь. Сформулируй задачу, а я подскажу, как сделать это в системе."
 
 import os
 import logging
@@ -43,6 +503,50 @@ from collections import defaultdict, deque
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 from openai import OpenAI
+
+PREFS_FILE = Path("user_prefs.json")
+
+def _load_prefs():
+    if PREFS_FILE.exists():
+        try:
+            return json.loads(PREFS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def _save_prefs(data: dict):
+    try:
+        PREFS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def get_user_prefs(user_id: int):
+    prefs = _load_prefs()
+    return prefs.get(str(user_id), {"style": "friendly", "name": None})
+
+def set_user_prefs(user_id: int, **kwargs):
+    prefs = _load_prefs()
+    u = prefs.get(str(user_id), {"style": "friendly", "name": None})
+    u.update({k:v for k,v in kwargs.items() if v is not None})
+    prefs[str(user_id)] = u
+    _save_prefs(prefs)
+
+
+async def typing(chat_id: int, bot, seconds: float = 0.8):
+    await bot.send_chat_action(chat_id, ChatAction.TYPING)
+    # легкая пауза — ощущение "человечности"
+    await asyncio.sleep(seconds)
+
+def style_wrap(text: str, style: str = "friendly"):
+    text = text.strip()
+    if style == "friendly":
+        return text + " 🙂"
+    if style == "expert":
+        return text  # сухо и по делу
+    if style == "playful":
+        return text + " 😺"
+    return text
+
 
 # Инициализация OpenAI-клиента (без proxies!)
 _openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -55,6 +559,13 @@ SYSTEM_PROMPT = (
     "Пиши естественно, коротко и по делу; можно эмодзи, но умеренно. "
     "Если вопрос про код/команды — дай пример. Если вопрос неясен — уточни один вопрос. "
     "Избегай канцелярита и резких формулировок."
+    "Ты работаешь в компании Omni360, поэтому рекомендуй обращаться к её сотрудникам, а не к сторонним агентствам."
+    "Если пользователь просит подобрать/собрать/выбрать экраны: (билборды, суперсайты, ситиборды/ситиформаты, медиафасады и т.п., упоминает город/города/«по всей стране») - НЕ подбирай сама. Вежливо подскажи отправить ту же фразу с /ask или /pick_city Москва 20 format=BILLBOARD "
+    "Если просят «план/расписание/прогноз» (например, «план на неделю…») - Аналогично: «Для этого используй команду: /ask <исходная фраза пользователя> или /forecast budget=2.5m days=7 hours_per_day=10»"
+    "Если пользователь уже использует /ask — не вмешивайся; эту команду обрабатывает логика бота."
+    "Если запрос не про подбор/план то отвечай как обычный ассистент (поддержать диалог, подсказать где что находится в системе и т.п.)"
+    "Нельзя выдумывать списки адресов/экранов и технические детали, которых нет в системе"
+    "Если просят собрать список других объектов - например, ТЦ, аптеки, магазины и так далее - то нужно выдать список реальных объектов нужного типа в локации и выгрузить его в эксель файл с названиями и координатами."
 )
 
 def build_messages(user_id: int, user_text: str):
@@ -76,6 +587,44 @@ def chat_with_memory(user_input):
     bot_reply = response.choices[0].message.content
     conversation.append({"role": "assistant", "content": bot_reply})
     return bot_reply
+
+async def smart_reply(user_text: str, user_name: str | None, style: str) -> str:
+    # короткая нормализация
+    prompt_name = f" Пользователь: {user_name}." if user_name else ""
+    system = (
+        "Ты дружелюбный, вежливый ассистент на русском. Отвечай кратко, по существу, но тепло. "
+        "Избегай канцелярита. Если вопрос неясный — уточни в одном коротком вопросе."
+        "Ты работаешь в компании Omni360, поэтому рекомендуй обращаться к её сотрудникам, а не к сторонним агентствам."
+        "Если просят подобрать / собрать / выбрать билборды / ситиформаты / любые другие экраны в каком-то городе, отвечай, что нужно дать такую же команду, но с /ask или /pick_city Москва 20 format=BILLBOARD."
+        "Если просят «план/расписание/прогноз» (например, «план на неделю…») - Аналогично: «Для этого используй команду: /ask <исходная фраза пользователя> или /forecast budget=2.5m days=7 hours_per_day=10»"
+        "Если пользователь уже использует /ask — не вмешивайся; эту команду обрабатывает логика бота."
+        "Если запрос не про подбор/план то отвечай как обычный ассистент (поддержать диалог, подсказать где что находится в системе и т.п.)"
+        "Нельзя выдумывать списки адресов/экранов и технические детали, которых нет в системе"
+        "Если просят собрать список других объектов - например, ТЦ, аптеки, магазины и так далее - то нужно выдать список реальных объектов нужного типа в локации и выгрузить его в эксель файл с названиями и координатами."
+
+    )
+    style_hint = {
+        "friendly": "Тон дружелюбный и поддерживающий.",
+        "expert": "Тон деловой и экспертный, но дружелюбный.",
+        "playful": "Тон легкий и игривый, можно емодзи уместно."
+    }.get(style, "Тон дружелюбный.")
+    try:
+        # если используешь openai==2.x
+        resp = _openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system + " " + style_hint},
+                {"role": "user", "content": user_text + prompt_name}
+            ],
+            temperature=0.7,
+            max_tokens=400
+        )
+        text = resp.choices[0].message.content.strip()
+        return text
+    except Exception:
+        # запасной вариант
+        base = "Пока не могу позвать модель, но вот как я это вижу: "
+        return base + user_text
 
 
 # --- системный промпт ---
@@ -104,6 +653,35 @@ NLU_SYSTEM_PROMPT = """Ты — маршрутизатор запросов по
 Форматы нормализуй в UPPER_SNAKE_CASE (BILLBOARD, SUPERSITE, CITY_BOARD, MEDIA_FACADE и т.п.). Если формат слитно (напр. MEDIAFACADE, CITYBOARD) — вставь "_" по смыслу.
 Числа распознавай из текста. Если данных не хватает — верни intent и то, что понял.
 """
+# ---- safe Telegram send helpers ----
+import html
+from aiogram.exceptions import TelegramBadRequest
+
+TG_LIMIT = 4096  # max text length per message
+
+def _escape_html_for_tg(text: str) -> str:
+    # Экранируем все угловые скобки и амперсанды, чтобы не было "Unsupported start tag"
+    return html.escape(text, quote=False)
+
+def _chunks(s: str, n: int):
+    for i in range(0, len(s), n):
+        yield s[i:i+n]
+
+async def safe_answer(message, text: str, parse_mode: str | None = "HTML"):
+    """Присылает текст, защищая от HTML/Markdown ошибок и длины > 4096."""
+    if not isinstance(text, str):
+        text = str(text)
+
+    # 1) Экранируем, если используем HTML
+    to_send = _escape_html_for_tg(text) if parse_mode == "HTML" else text
+
+    try:
+        for part in _chunks(to_send, TG_LIMIT):
+            await message.answer(part, parse_mode=parse_mode)
+    except TelegramBadRequest:
+        # 2) Фолбэк: без форматирования вообще
+        for part in _chunks(text, TG_LIMIT):
+            await message.answer(part)  # parse_mode=None
 
 # --- функция маршрутизации ---
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=8))
@@ -135,11 +713,44 @@ except Exception:
 from datetime import datetime
 import io
 from aiogram.types import BufferedInputFile
-
-
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandStart
 from aiogram.types import BufferedInputFile  # для отправки файлов из памяти
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.types import Message
+
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+
+
+from aiogram import Router, F
+intents_router = Router(name="intents")
+dp.include_router(intents_router)   # <-- первым
+
+# Ловим естественные запросы без слэша
+
+@intents_router.message(F.text & ~F.text.startswith("/") & F.text.func(lambda t: bool(ASK_PATTERN.search(t or ""))))
+async def handle_natural_ask(m: types.Message):
+    return await _handle_ask_like_text(m, m.text or "")
+
+# --- UX router (должен быть выше dp.include_router) ---
+
+ux_router.message.filter(F.chat.type == "private")
+
+@ux_router.message(CommandStart())
+async def on_start(message: Message):
+    await message.answer("Привет! Я на связи ✨")
+
+@ux_router.message(Command("help"))
+async def on_help(message: Message):
+    await message.answer("Доступные команды: /start, /help, /style")
+
+@ux_router.message(F.text.lower().in_({"привет", "здорова", "хай"}))
+async def smalltalk(message: Message):
+    await message.answer("Привет-привет! 👋")
 
 def _ssl_ctx_certifi() -> ssl.SSLContext:
     """Создаёт безопасный SSL-контекст с CA из certifi, если доступен."""
@@ -185,21 +796,12 @@ SCREENS = None
 LAST_RESULT = None
 
 # — новые переменные для кэша —
-from pathlib import Path
-import time, json
 
 LAST_SYNC_TS: float | None = None
 CACHE_PARQUET = Path(DATA_DIR) / "screens_cache.parquet"
 CACHE_CSV     = Path(DATA_DIR) / "screens_cache.csv"
 CACHE_META    = Path(DATA_DIR) / "screens_cache.meta.json"
 
-
-# ====== НАСТРОЙКА БОТА ======
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise SystemExit("Set BOT_TOKEN env var first")
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
 
 # ====== ХРАНИЛИЩЕ (MVP) ======
 SCREENS: pd.DataFrame | None = None
@@ -231,7 +833,6 @@ HELP = (
     "   Опции случайности: shuffle=1 | fixed=1 | seed=42\n\n"
     "• /pick_at <lat> <lon> <N> [R] — равномерная выборка в круге\n"
     "   Пример: /pick_at 55.75 37.62 25 15\n\n"
-    "• /export_last — выгрузить последнюю выборку (CSV)\n"
     "• Отправьте геолокацию 📍 — найду экраны вокруг точки с радиусом по умолчанию\n\n"
     "🔤 Фильтры:\n"
     "   format=city — все CITY_FORMAT_* (алиас «гиды»)\n"
@@ -241,8 +842,6 @@ HELP = (
     "🧩 Пропорции (квоты) форматов в /pick_city:\n"
     "   mix=BILLBOARD:60%,CITY:40%  или  mix=CITY_FORMAT_RC:5,CITY_FORMAT_WD:15\n"
 )
-
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 # ---------- helpers for /plan ----------
 import re
@@ -303,7 +902,6 @@ def _to_float(val, default):
 # ---------- /helpers ----------
 
 from aiogram import F
-from aiogram.types import Message
 
 MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # можно задать через env
 
@@ -320,6 +918,82 @@ async def llm_reply(messages):
         max_tokens=512,
     )
     return resp.choices[0].message.content.strip()
+
+
+@ux_router.message(CommandStart())
+async def on_start(message: Message, bot: Bot):
+    u = message.from_user
+    prefs = get_user_prefs(u.id)
+    set_user_prefs(u.id, name=(u.first_name or prefs.get("name")), style=prefs.get("style", "friendly"))
+    await typing(message.chat.id, bot, 0.6)
+    hi = f"Привет, {u.first_name or 'друг'}! Я Omni_helper — рядом, если что. "
+    tips = "Попробуй: /ask «подбери 30 билбордов…» или /ask «сделай краткий прогноз…»\nКоманды: /help, /style, /cancel"
+    await message.answer(style_wrap(hi + tips, prefs.get("style", "friendly")))
+
+
+
+@ux_router.message(Command("help"))
+async def on_help(message: Message, bot: Bot):
+    await typing(message.chat.id, bot, 0.5)
+    await message.answer(
+        "Я умею болтать и помогать по работе. Примеры:\n"
+        "• /ask подбери 30 билбордов по Москве равномерно\n"
+        "• /ask прогноз на неделю по последней выборке\n"
+        "Также: /style — сменить тон общения; просто скажи «меня зовут …» чтобы запомнила имя."
+    )
+
+@ux_router.message(Command("style"))
+async def on_style(message: Message, bot: Bot):
+    """
+    /style — показать текущий стиль
+    /style friendly|expert|playful — поменять стиль
+    """
+    u = message.from_user
+    args = (message.text or "").split(maxsplit=1)
+    prefs = get_user_prefs(u.id)
+    if len(args) == 1:
+        await typing(message.chat.id, bot, 0.3)
+        return await message.answer(f"Текущий стиль: {prefs['style']}. Доступно: friendly, expert, playful.\nНапример: /style friendly")
+    new_style = args[1].strip().lower()
+    if new_style not in {"friendly","expert","playful"}:
+        return await message.answer("Выбери один из: friendly, expert, playful.")
+    set_user_prefs(u.id, style=new_style)
+    await typing(message.chat.id, bot, 0.3)
+    await message.answer(style_wrap(f"Готово! Стиль теперь: {new_style}", new_style))
+
+# запоминание имени по фразе "меня зовут ..."
+@ux_router.message(F.text.regexp(r"(?i)\bменя зовут\s+([A-Za-zА-Яа-яЁё\- ]{2,})\b"))
+async def on_my_name(message: Message, bot: Bot):
+    name = re.search(r"(?i)\bменя зовут\s+([A-Za-zА-Яа-яЁё\- ]{2,})\b", message.text).group(1).strip().split()[0]
+    set_user_prefs(message.from_user.id, name=name)
+    await typing(message.chat.id, bot, 0.4)
+    await message.answer(style_wrap(f"Отлично, {name}! Запомнила 😊", get_user_prefs(message.from_user.id)["style"]))
+
+# лёгкий смолток: привет/спасибо/как дела и т.п.
+_SMALLTALK_PATTERNS = {
+    r"(?i)прив(ет|ики)|здравствуй|добрый (день|вечер|утро)": "Привет! Чем могу помочь?",
+    r"(?i)спасибо|спс|благодарю": "Пожалуйста! Обращайся, если что ⭐️",
+    r"(?i)как дела|как ты": "Лучше всех! Готова помочь. Что делаем?",
+}
+
+@ux_router.message(F.text.func(lambda t: any(re.search(p, t or "") for p in _SMALLTALK_PATTERNS)))
+async def on_smalltalk(message: Message, bot: Bot):
+    prefs = get_user_prefs(message.from_user.id)
+    reply = next((v for p, v in _SMALLTALK_PATTERNS.items() if re.search(p, message.text)), "Я здесь, слушаю!")
+    await typing(message.chat.id, bot, 0.5)
+    await message.answer(style_wrap(reply, prefs["style"]))
+
+# общий «болталка»-обработчик (последний по приоритету)
+@ux_router.message(
+    F.text
+    & ~F.text.func(lambda t: ASK_PATTERN.search(t or ""))  # НЕ ловим ask/подбери/план
+)
+async def on_chat(message: Message, bot: Bot):
+    prefs = get_user_prefs(message.from_user.id)
+    await typing(message.chat.id, bot, min(1.0, 0.2 + len(message.text)/100))
+    text = await smart_reply(message.text, prefs.get("name"), prefs.get("style"))
+    await message.answer(style_wrap(text, prefs.get("style")))
+
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def smalltalk(message: Message):
@@ -344,7 +1018,7 @@ async def smalltalk(message: Message):
         DIALOG_MEMORY[user_id].append(("user", text))
         DIALOG_MEMORY[user_id].append(("assistant", answer))
 
-        await message.answer(answer)
+        await safe_answer(message, answer, parse_mode="HTML")  # или parse_mode=None, если не нужен HTML
     except Exception as e:
         logging.exception("LLM error")
         await message.answer(
@@ -366,6 +1040,10 @@ CITY_SYNONYMS = {
     "ростове": "Ростов-на-Дону",
     "самаре": "Самара",
     "казани": "Казань",
+    "москва": "Москва",    
+    "москве": "Москва",
+
+
 }
 
 FORMAT_SYNONYMS = {
@@ -1477,10 +2155,6 @@ def _auth_headers_all_variants(token: str) -> list[tuple[str, dict]]:
     ]
 
 from urllib.parse import urljoin
-import json
-import aiohttp
-
-from urllib.parse import urljoin
 import json, aiohttp, logging
 
 # --- API FETCH (постраничная загрузка инвентаря с серверной фильтрацией) ---
@@ -1637,6 +2311,8 @@ CITY_SYNONYMS = {
     "питер": "санкт-петербург",
     "санкт петербург": "санкт-петербург",
     "мск": "москва",
+    "москва": "Москва",    
+    "москве": "Москва",
 }
 
 def _norm_text(s: str) -> str:
@@ -1700,6 +2376,8 @@ CITY_SYNONYMS = {
     "спб": "санкт-петербург",
     "санкт петербург": "санкт-петербург",
     "питер": "санкт-петербург",
+    "москва": "Москва",    
+    "москве": "Москва",
 }
 
 def _norm_city(s: str) -> str:
@@ -4843,38 +5521,6 @@ async def cmd_ask(m: types.Message):
 
 from aiogram import F
 
-@dp.message(F.text == "📂 Как загрузить CSV/XLSX")
-async def how_to_upload(m: types.Message):
-    await m.answer(
-        "📂 Загрузка файла:\n"
-        "— Отправь в этот чат CSV или XLSX c колонками: screen_id, name, lat, lon, city, format, owner, ...\n"
-        "— Я всё распознаю автоматически и включу клавиатуру с действиями.\n"
-        "Подсказка: можно просто перетащить файл в чат с ботом."
-    )
-
-@dp.message(F.text == "🎯 Подбор по городу")
-async def hint_pick_city(m: types.Message):
-    await m.answer(
-        "Пример: `/pick_city Москва 20 format=BILLBOARD,SUPERSITE fixed=1 seed=7`\n"
-        "Или: `/ask подбери 30 билбордов и суперсайтов по Москве равномерно`",
-        parse_mode="Markdown"
-    )
-
-@dp.message(F.text == "🌍 По всей стране")
-async def hint_pick_any(m: types.Message):
-    await m.answer(
-        "Пример: `/pick_any 100 format=MEDIAFACADE fixed=1 seed=7`\n"
-        "Или: `/ask подбери 120 MEDIAFACADE по всей стране`",
-        parse_mode="Markdown"
-    )
-
-@dp.message(F.text == "📌 В радиусе")
-async def hint_near(m: types.Message):
-    await m.answer(
-        "Пример: `/pick_at 55.751 37.618 25 12 format=BILLBOARD`\n"
-        "Или: `/near 55.751 37.618 3 fields=screen_id`",
-        parse_mode="Markdown"
-    )
 
 # ================== NLU helpers (plan + pick_city) ==================
 import re
@@ -4884,6 +5530,7 @@ _CITY_ALIASES = {
     "спб":"Санкт-Петербург","питер":"Санкт-Петербург",
     "санкт-петербург":"Санкт-Петербург","санкт петербург":"Санкт-Петербург","петербург":"Санкт-Петербург",
     "мск":"Москва","москва":"Москва",
+    "москве": "Москва",
     "екб":"Екатеринбург","екатеринбург":"Екатеринбург",
     "нижний":"Нижний Новгород","нижний новгород":"Нижний Новгород",
     "великий новгород":"Великий Новгород","новгород":"Великий Новгород",
@@ -4991,20 +5638,63 @@ def parse_plan_nl(text: str) -> dict:
     # иначе — это не плановая формулировка
     return {"cities": [], "format": None, "days": None, "hours": None}
 
-def parse_pick_city_nl(text: str) -> dict:
-    """
-    Подбор в городе: {city, n, formats, even}.
-    Срабатывает на фразы типа «собери/подбери/выбери 20 билбордов по Казани (равномерно)».
-    """
-    t = _nrm(text)
-    cities = _find_cities(t)
-    n = _extract_n(t)
-    fmt = _find_format(t)
-    even = bool(re.search(r"равномерн", t))
-    verbs = bool(re.search(r"\b(собер(и|ите)|подбер(и|ите)|выбер(и|ите))\b", t))
-    if cities and n:
-        return {"city": cities[0], "n": n, "formats": ([fmt] if fmt else []), "even": even or not verbs}
-    return {"city": None, "n": None, "formats": [], "even": False}
+# ====== НОРМАЛИЗАЦИЯ ГОРОДОВ/ФОРМАТОВ ДЛЯ "подбери N ..." ======
+import re
+from typing import Dict, Any, List
+
+_CITY_ALIASES = {
+    # Москва
+    "москве": "Москва", "москвы": "Москва", "москов": "Москва",
+    "москва": "Москва",
+    # Санкт-Петербург
+    "петербургу": "Санкт-Петербург", "петербурга": "Санкт-Петербург",
+    "петербург": "Санкт-Петербург", "спб": "Санкт-Петербург",
+    "санкт-петербург": "Санкт-Петербург", "санкт петербург": "Санкт-Петербург",
+    # Частые города (добавляй по мере надобности)
+    "казани": "Казань", "казань": "Казань",
+    "ростову": "Ростов-на-Дону", "ростова": "Ростов-на-Дону",
+    "ростов-на-дону": "Ростов-на-Дону", "ростов на дону": "Ростов-на-Дону",
+    "нижнему новгороду": "Нижний Новгород", "нижнего новгорода": "Нижний Новгород",
+    "нижний новгород": "Нижний Новгород",
+}
+
+_FORMAT_KEYWORDS = {
+    "BILLBOARD":  [r"\bбилборд\w*\b", r"\bщит\w*\b"],
+    "SUPERSITE":  [r"\bсуперсайт\w*\b", r"\bсуперборд\w*\b"],
+    # при желании добавь: CITYBOARD, MEDIAFACADE, DIGITAL и т.д.
+}
+
+_CITY_RX = re.compile(
+    r"""(?:
+            \bпо(?:\s+городу)?\s+|
+            \bв(?:\s+городе)?\s+|
+            \bдля\s+
+        )
+        (?P<city>[A-Za-zА-Яа-яЁё\-\s]+)
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
+
+def _canon_city(raw: str) -> str | None:
+    s = (raw or "").strip().lower().replace("ё", "е")
+    s = re.sub(r"\s+", " ", s)
+    if s in _CITY_ALIASES:
+        return _CITY_ALIASES[s]
+    # для составных названий попробуем точное тайтл-кейс
+    s_t = " ".join(w.capitalize() for w in s.split())
+    # быстрые эвристики: Москва / Санкт-Петербург
+    if s_t in ("Москва", "Санкт-петербург", "Санкт-Петербург"):
+        return "Москва" if s_t == "Москва" else "Санкт-Петербург"
+    return s_t if len(s_t) >= 2 else None
+
+def _extract_formats(text: str) -> List[str]:
+    found = []
+    for fmt, pats in _FORMAT_KEYWORDS.items():
+        for p in pats:
+            if re.search(p, text, flags=re.IGNORECASE):
+                found.append(fmt); break
+    return list(dict.fromkeys(found))  # уникальные, в порядке находки
+
 
 # ================== /ask + helpers (clean) ==================
 import re
@@ -5163,33 +5853,135 @@ def parse_plan_nl(text: str) -> dict:
     return {"cities": cities, "format": fmt, "days": days, "hours": hours}
 
 # --- парсер «подбор по городу» ---
-def parse_pick_city_nl(text: str) -> dict:
-    return {
-        "city":    extract_city(text),
-        "n":       extract_number(text),
-        "formats": extract_formats(text),
-        "even":    has_even_hint(text),
-    }
+import re
 
-# ================== /ask ==================
-@dp.message(Command("ask"))
-async def cmd_ask(m: types.Message):
-    """
-    Естественные запросы:
-      • Подбор: «подбери 100 билбордов и суперсайтов по Петербургу»
-      • План:   «план на неделю по ситибордам в Ростове, 12 часов в день»
-    Всё вызывается через _call_args (без подмены m.text).
-    """
-    text  = (m.text or "")
-    query = text.partition(" ")[2].strip() or text
+# Канонизация городов и синонимов
+CITY_ALIASES = {
+    "мск": "Москва", "москва": "Москва",
+    "спб": "Санкт-Петербург", "питер": "Санкт-Петербург",
+    "санкт-петербург": "Санкт-Петербург", "санкт петербург": "Санкт-Петербург",
+    "казань": "Казань",
+    # при желании — дополни:
+    "ростов": "Ростов-на-Дону", "ростов-на-дону": "Ростов-на-Дону",
+    "екатеринбург": "Екатеринбург", "новосибирск": "Новосибирск",
+    "нижний новгород": "Нижний Новгород", "самара": "Самара",
+}
+
+KNOWN_CITIES = set(CITY_ALIASES.values()) | {
+    "Воронеж","Пермь","Волгоград","Красноярск","Омск","Уфа","Челябинск"
+}
+
+# Словарь русских слов форматов -> внутренние коды
+FORMAT_MAP = {
+    r"билборд\w*": "BILLBOARD",
+    r"суперсайт\w*": "SUPERSITE",
+    r"ситиборд\w*": "CITYBOARD",
+    r"сити-?борд\w*": "CITYBOARD",
+    r"медиафасад\w*": "MEDIAFACADE",
+    r"экра(н|ны)\w*": "DIGITAL",
+    r"digital|диджитал": "DIGITAL",
+}
+
+EVEN_PAT = re.compile(r"равномерн", re.IGNORECASE)
+
+def _norm_city(raw: str) -> str | None:
+    s = re.sub(r"[^\w\s\-]+", " ", raw.lower()).strip()
+    s = re.sub(r"\s+", " ", s)
+    if s in CITY_ALIASES:
+        return CITY_ALIASES[s]
+    # пробуем канонизировать “Москва”, “Казань”, …
+    c = s.title()
+    return c if c in KNOWN_CITIES else None
+
+def _find_city(q: str) -> str | None:
+    ql = q.lower()
+
+    # "по всей стране" / "*" — спец. случай
+    if any(k in ql for k in ["по всей стране","по россии","вся страна","по рф","все города"]) or "*" in ql:
+        return "*"
+
+    # Шаблоны по корням/синонимам (ловят падежи: москв*, казан*, петербург*, …)
+    CITY_PATTERNS = [
+        (r"\bмоскв\w*\b", "Москва"),
+        (r"\bспб\b", "Санкт-Петербург"),
+        (r"\bпитер\w*\b", "Санкт-Петербург"),
+        (r"\bсанкт[\s-]?петербург\w*\b", "Санкт-Петербург"),
+        (r"\bпетербург\w*\b", "Санкт-Петербург"),
+        (r"\bказан\w*\b", "Казань"),
+        (r"\bростов(?:-на-дону)?\w*\b", "Ростов-на-Дону"),
+        (r"\bекатеринбург\w*\b", "Екатеринбург"),
+        (r"\bновосибирск\w*\b", "Новосибирск"),
+        (r"\bнижн\w*\s+новгород\w*\b", "Нижний Новгород"),
+        (r"\bсамар\w*\b", "Самара"),
+        (r"\bворонеж\w*\b", "Воронеж"),
+        (r"\bперм\w*\b", "Пермь"),
+        (r"\bволгоград\w*\b", "Волгоград"),
+        (r"\bкрасноярск\w*\b", "Красноярск"),
+        (r"\bомск\w*\b", "Омск"),
+        (r"\bуфа\w*\b", "Уфа"),
+        (r"\bчелябинск\w*\b", "Челябинск"),
+    ]
+    for pat, canon in CITY_PATTERNS:
+        if re.search(pat, ql, re.IGNORECASE):
+            return canon
+
+    # Доп. попытка: после предлогов берём слово и снимаем одну букву падежа (…е/…и/…у)
+    m = re.search(r"(?:по|в|для|по городу|в городе)\s+([A-Za-zА-Яа-яёЁ\-\s]+)", ql, re.IGNORECASE)
+    if m:
+        cand = m.group(1).strip()
+        # обрезаем финальную падежную букву — "москве"->"москв", "казани"->"казан"
+        cand_root = re.sub(r"[еиуао]$", "", cand)
+        for pat, canon in CITY_PATTERNS:
+            if re.search(pat, cand_root, re.IGNORECASE):
+                return canon
+
+    return None
+
+def _find_n(q: str) -> int | None:
+    m = re.search(r"(\d+)\s*(?:шт|штук)?", q)
+    return int(m.group(1)) if m else None
+
+def _find_formats(q: str) -> list[str]:
+    res = []
+    for pat, code in FORMAT_MAP.items():
+        if re.search(pat, q, re.IGNORECASE):
+            res.append(code)
+    # если явно сказали “суперсайты и билборды” — порядок не важен
+    return list(dict.fromkeys(res))  # уникализация с сохранением порядка
+
+
+# ================== /ask и болталка ==================
+from aiogram import Router, F, types
+from aiogram.types import Message
+
+ux_router = Router(name="humanize")
+ux_router.message.filter(F.chat.type == "private")
+
+
+# ==== общее ядро для /ask и естественных фраз ====
+async def _handle_ask_like_text(m: types.Message, raw_text: str):
+    text  = (raw_text or "").strip()
+    query = text  # без отрезания команды — сюда можно подавать всё
+
+    # Простая поддержка "по всей стране"
+    ql = query.lower()
+    if any(kw in ql for kw in ["по всей стране", "по россии", "все города", "по рф", "по стране", "* вся страна"]):
+        if "*" not in query:
+            query = (query
+                     .replace("по всей стране", "*")
+                     .replace("по россии", "*")
+                     .replace("все города", "*")
+                     .replace("по рф", "*")
+                     .replace("по стране", "*"))
 
     # --- 1) Подбор (pick_city) ---
     nl_pick = parse_pick_city_nl(query)
     if nl_pick.get("city") and nl_pick.get("n"):
         city    = nl_pick["city"]
         n       = nl_pick["n"]
-        formats = nl_pick["formats"] or []
-        even    = bool(nl_pick["even"])
+        # дефолты форматов
+        formats = (nl_pick.get("formats") or ["BILLBOARD", "SUPERSITE"])
+        even    = bool(nl_pick.get("even"))
 
         preview = ["/pick_city", city, str(n)]
         if formats:
@@ -5201,11 +5993,11 @@ async def cmd_ask(m: types.Message):
         return await pick_city(m, _call_args={
             "city":    city,
             "n":       n,
-            "formats": formats,   # список, например ["BILLBOARD","SUPERSITE"]
+            "formats": formats,
             "owners":  [],
             "fields":  [],
             "shuffle": False,
-            "fixed":   even,      # равномерность воспроизводима
+            "fixed":   even,
             "seed":    42 if even else None,
         })
 
@@ -5240,6 +6032,176 @@ async def cmd_ask(m: types.Message):
         "• План: «план на неделю по ситибордам в Ростове, 12 часов в день»"
     )
 
+async def _maybe_handle_intent(m: types.Message, raw_text: str) -> bool:
+    text  = (raw_text or "").strip()
+    query = text
+
+    ql = query.lower()
+    if any(kw in ql for kw in ["по всей стране","по россии","все города","по рф","по стране"]) or "*" in ql:
+        if "*" not in query:
+            query = (query
+                .replace("по всей стране", "*")
+                .replace("по россии", "*")
+                .replace("все города", "*")
+                .replace("по рф", "*")
+                .replace("по стране", "*"))
+
+    # 1) Подбор
+    nl_pick = parse_pick_city_nl(query)
+    if nl_pick.get("city") and nl_pick.get("n"):
+        city    = nl_pick["city"]
+        n       = nl_pick["n"]
+        formats = nl_pick.get("formats") or []
+        even    = bool(nl_pick.get("even"))
+
+        preview = ["/pick_city", city, str(n)]
+        if formats: preview.append("format=" + ",".join(formats))
+        if even:    preview.append("fixed=1")
+        await m.answer("Сделаю так: " + " ".join(preview))
+
+        await pick_city(m, _call_args={
+            "city":    city,
+            "n":       n,
+            "formats": formats,
+            "owners":  [],
+            "fields":  [],
+            "shuffle": False,
+            "fixed":   even,
+            "seed":    42 if even else None,
+        })
+        return True
+
+    # 2) План
+    nl_plan = parse_plan_nl(query)
+    if nl_plan.get("cities"):
+        fmt   = nl_plan.get("format")
+        days  = nl_plan.get("days")  or 7
+        hours = nl_plan.get("hours") or 12
+        formats_req = [fmt] if fmt else []
+        parts = ["/plan", "города=" + ";".join(nl_plan["cities"])]
+        if formats_req: parts.append("format=" + ",".join(formats_req))
+        parts += [f"days={days}", f"hours={hours}", "mode=even", "rank=ots"]
+        await m.answer("Поняла запрос как: " + " ".join(parts))
+
+        await _plan_core(
+            m,
+            cities=nl_plan["cities"],
+            days=days,
+            hours=hours,
+            formats_req=formats_req,
+            max_per_city=None,
+            max_total=None,
+            budget_total=None,
+            mode="even",
+            rank="ots",
+        )
+        return True
+        # --- 3) Не распознали, но очень похоже на задачу — подскажем /ask ---
+    if _looks_like_pick_or_plan(query):
+        await m.answer(f"Давай запустим это как команду:\n/ask {query}")
+        return True
+
+    return False
+
+# ================== /ask ==================
+@dp.message(Command("ask"))
+async def cmd_ask(m: types.Message):
+    text  = (m.text or "")
+    query = text.partition(" ")[2].strip() or text
+    return await _handle_ask_like_text(m, query)
+
+# --- если фраза похожа на "подбор/план", мягко просим запустить /ask ---
+@ux_router.message(
+    F.text.regexp(re.compile(r'(?iu)\b(подбери|подбор|выбери|собери|план|расписание|график)\b'))
+)
+
+
+async def nudge_to_ask(message: Message):
+    # ничего не парсим — просто предлагаем ту же фразу через /ask
+    await message.answer(f"Запущу это через команду:\n/ask {message.text}")
+
+# общий «болталка»-обработчик (последний по приоритету)
+@ux_router.message(F.text)
+async def human_text(message: Message, bot: Bot):
+    handled = await _maybe_handle_intent(message, message.text)  # <- сначала пытаемся понять намерение
+    if handled:
+        return
+    prefs = get_user_prefs(message.from_user.id)
+    await typing(message.chat.id, bot, min(1.0, 0.2 + len(message.text)/100))
+    text = await smart_reply(message.text, prefs.get("name"), prefs.get("style"))
+    await message.answer(style_wrap(text, prefs.get("style")))
+
+
+dp.include_router(ux_router) 
+
+# ==== общее ядро для /ask и естественных фраз ====
+async def _handle_ask_like_text(m: types.Message, raw_text: str):
+    text  = (raw_text or "").strip()
+    query = text  # без отрезания команды — сюда можно подавать всё
+
+    # Простая поддержка "по всей стране"
+    ql = query.lower()
+    if any(kw in ql for kw in ["по всей стране", "по россии", "все города", "по рф", "по стране", "* вся страна"]):
+        # лёгкий хак: если город не указан, подставим '*'
+        if " * " not in query and " *" not in query and "*" not in query:
+            query = query.replace("по всей стране", "*").replace("по россии", "*").replace("все города", "*").replace("по рф", "*").replace("по стране", "*")
+
+    # --- 1) Подбор (pick_city) ---
+    nl_pick = parse_pick_city_nl(query)
+    if nl_pick.get("city") and nl_pick.get("n"):
+        city    = nl_pick["city"]
+        n       = nl_pick["n"]
+        formats = nl_pick.get("formats") or []
+        even    = bool(nl_pick.get("even"))
+
+        preview = ["/pick_city", city, str(n)]
+        if formats:
+            preview.append("format=" + ",".join(formats))
+        if even:
+            preview.append("fixed=1")
+        await m.answer("Сделаю так: " + " ".join(preview))
+
+        return await pick_city(m, _call_args={
+            "city":    city,
+            "n":       n,
+            "formats": formats,
+            "owners":  [],
+            "fields":  [],
+            "shuffle": False,
+            "fixed":   even,
+            "seed":    42 if even else None,
+        })
+
+    # --- 2) План (plan) ---
+    nl_plan = parse_plan_nl(query)
+    if nl_plan.get("cities"):
+        fmt   = nl_plan.get("format")
+        days  = nl_plan.get("days")  or 7
+        hours = nl_plan.get("hours") or 12
+        formats_req = [fmt] if fmt else []
+        parts = ["/plan", "города=" + ";".join(nl_plan["cities"])]
+        if formats_req: parts.append("format=" + ",".join(formats_req))
+        parts += [f"days={days}", f"hours={hours}", "mode=even", "rank=ots"]
+        await m.answer("Поняла запрос как: " + " ".join(parts))
+        return await _plan_core(
+            m,
+            cities=nl_plan["cities"],
+            days=days,
+            hours=hours,
+            formats_req=formats_req,
+            max_per_city=None,
+            max_total=None,
+            budget_total=None,
+            mode="even",
+            rank="ots",
+        )
+
+    # --- 3) Фолбэк ---
+    await m.answer(
+        "Пока понимаю два типа запросов:\n"
+        "• Подбор: «подбери 100 билбордов и суперсайтов по Петербургу»\n"
+        "• План: «план на неделю по ситибордам в Ростове, 12 часов в день»"
+    )
 # ======== Фотоотчёты по кампании ========
 
 def _normalize_shots(data) -> pd.DataFrame:
@@ -6213,7 +7175,8 @@ async def pick_city(m: types.Message, _call_args: dict | None = None):
         "санкт петербург": "Санкт-Петербург",
         "санкт-петербург": "Санкт-Петербург",
         "петербург": "Санкт-Петербург",
-        "москва": "Москва",
+        "москва": "Москва",   
+        "москве": "Москва",
     }
 
     def _parse_kwargs(tokens: list[str]) -> dict:
@@ -6656,73 +7619,43 @@ async def fallback_text(m: types.Message):
             "Чтобы начать, можете задать вопрос, например /ask подбери 30 билбордов и суперсайтов по Москве равномерно или /ask прогноз на неделю по последней выборке",
             reply_markup=kb_loaded()
         )
-# --- keyboards.py (или в bot.py рядом с хендлерами) ---
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
-def kb_empty() -> ReplyKeyboardMarkup:
-    # когда инвентарь НЕ загружен
-    return ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        keyboard=[
-            [KeyboardButton(text="📂 Как загрузить CSV/XLSX")],
-            [KeyboardButton(text="❓ /help"), KeyboardButton(text="ℹ️ /status")],
-            [KeyboardButton(text="💬 /ask")],
-        ]
-    )
 
-def kb_loaded() -> ReplyKeyboardMarkup:
-    # когда инвентарь загружен
-    return ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        keyboard=[
-            [KeyboardButton(text="🎯 Подбор по городу"),
-             KeyboardButton(text="🌍 По всей стране"),
-             KeyboardButton(text="📌 В радиусе")],
-            [KeyboardButton(text="🧮 Прогноз /forecast"),
-             KeyboardButton(text="⬇️ Экспорт /export_last"),
-             KeyboardButton(text="ℹ️ /status")],
-            [KeyboardButton(text="💬 /ask"),
-             KeyboardButton(text="❓ /help")],
-        ]
-    )
 # ====== ЗАПУСК ======
-import os
+import asyncio
 import threading
 import logging
-import asyncio
 from flask import Flask
+import os
+from aiogram.filters import Command
+
+logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "OK: bot is running"
+    return "Bot is running!"
 
-def run_keepalive():
-    # Render пробрасывает порт в переменную среды PORT
+def run_flask():
     port = int(os.environ.get("PORT", 10000))
-    # Важно слушать 0.0.0.0 и именно этот порт
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
+    app.run(host="0.0.0.0", port=port, threaded=True)
 
 async def run_bot():
-    # если ты используешь aiogram v3:
-    # желательно на старте снять вебхук, чтобы не мешал polling
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        logging.warning(f"delete_webhook warning: {e}")
+    logging.info("run_bot(): старт")
+    bot_token = os.getenv("BOT_TOKEN")
+    if not bot_token:
+        logging.error("❌ BOT_TOKEN пуст. Проверь .env или переменные окружения.")
+        return
 
-    me = await bot.get_me()
-    logging.info(f"✅ Бот @{me.username} запущен и ждёт сообщений…")
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    @dp.message(Command("start"))
+    async def start(message: Message):
+        await message.answer("Привет! Омника онлайн 🚀")
 
-def main():
-    # стартуем keepalive http-сервер в отдельном потоке
-    t = threading.Thread(target=run_keepalive, daemon=True)
-    t.start()
-
-    # запускаем aiogram polling в главном потоке
-    asyncio.run(run_bot())
+    await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("✅ Aiogram polling запускается...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    threading.Thread(target=run_flask, daemon=True).start()
+    asyncio.run(run_bot())
