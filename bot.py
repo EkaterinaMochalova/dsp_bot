@@ -73,7 +73,7 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.openstreetmap.ru/api/interpreter",
 ]
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 # последнее найденное множество POI (для /near_geo без текста)
 LAST_POI: list[dict] = []
