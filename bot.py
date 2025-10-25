@@ -7155,7 +7155,7 @@ import aiohttp
 import pandas as pd
 import os
 
-INVENTORY_API_URL = os.getenv("OBDSP_BASE", "").strip()
+INVENTORY_API_URL = os.getenv("INVENTORY_API_URL", "").strip()
 INVENTORY_API_TOKEN = os.getenv("OBDSP_TOKEN", "").strip()
 
 async def _sync_api_pull(city=None, formats=None, owners=None):
