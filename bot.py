@@ -773,7 +773,7 @@ def _make_ssl_param_for_aiohttp():
     return _ssl_ctx_certifi()
 
 # ==== ENV CONFIG (читаем переменные окружения один раз при старте) ====
-OBDSP_BASE = os.getenv("OBDSP_BASE", "https://obdsp.projects.eraga.net").strip()
+OBDSP_BASE = os.getenv("OBDSP_BASE", "https://proddsp.projects.eraga.net").strip()
 OBDSP_TOKEN = os.getenv("OBDSP_TOKEN", "").strip()
 OBDSP_AUTH_SCHEME = os.getenv("OBDSP_AUTH_SCHEME", "Bearer").strip()  # "Bearer" | "Token" | "ApiKey" | "Basic"
 OBDSP_CLIENT_ID = os.getenv("OBDSP_CLIENT_ID", "").strip()
