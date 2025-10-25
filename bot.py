@@ -1175,13 +1175,14 @@ async def cmd_geo(m: types.Message):
 @geo_router.message(Command("near_geo"))
 async def cmd_near_geo(m: types.Message):
     """
-    /near_geo [R] [fields=screen_id] [dedup=1] [query=...] [city=...] [limit=...] [provider=...]
-    Варианты:
-      1) сначала /geo ... ; потом /near_geo 2
-      2) сразу: /near_geo 2 query="Твой дом" city=Москва limit=5
-    """
-    import io as _io
+    /near_geo [R] [fields=screen_id] [dedup=1]
+              [query=...] [city=...] [limit=...] [provider=...]
+              [format=...] [owner=...] [type=...] [placement=...] [installation=...]
 
+    Варианты:
+      1) сначала /geo ... ; потом /near_geo 2 format=BILLBOARD owner=russ
+      2) сразу: /near_geo 2 query="Твой дом" city=Москва limit=5 format=pvz_screen
+    """
     global SCREENS, LAST_RESULT, LAST_POI
     if SCREENS is None or SCREENS.empty:
         await m.answer("Сначала загрузите инвентарь (CSV/XLSX или /sync_api).")
@@ -1190,7 +1191,7 @@ async def cmd_near_geo(m: types.Message):
     text = (m.text or "").strip()
     tail = text.split()[1:]
 
-    # Радиус (если первый токен без '=')
+    # радиус как первый позиционный аргумент (если без '=')
     radius_km = USER_RADIUS.get(m.from_user.id, DEFAULT_RADIUS)
     start_i = 0
     if tail and "=" not in tail[0]:
@@ -1200,7 +1201,7 @@ async def cmd_near_geo(m: types.Message):
         except Exception:
             pass
 
-    # key=value
+    # ключевые опции
     kv = {}
     for p in tail[start_i:]:
         if "=" in p:
@@ -1210,35 +1211,50 @@ async def cmd_near_geo(m: types.Message):
     fields_req = (kv.get("fields") or "").strip()
     dedup = str(kv.get("dedup", "1")).lower() in {"1","true","yes","on"}
 
-    # Интегрированный поиск POI (если дали query=...)
+    # если указан query= — найдём POI на лету (без отдельного /geo)
     if "query" in kv:
         q = kv.get("query") or ""
         city = kv.get("city")
-        limit = int(kv.get("limit", "5") or 5)
-        provider = kv.get("provider", "nominatim")
+        try:
+            limit = int(kv.get("limit", "5") or 5)
+        except Exception:
+            limit = 5
+        provider = (kv.get("provider") or "nominatim").lower()
         await m.answer(f"🔎 Ищу точки «{q}»" + (f" в {city}" if city else "") + "…")
         try:
             LAST_POI = await geocode_query(q, city=city, limit=limit, provider=provider)
         except Exception as e:
-            await m.answer(f"🚫 Геокодер ответил ошибкой: {e}")
-            return
+            await m.answer(f"⚠️ Геокодер {provider} вернул ошибку: {e}. Пробую альтернативу…")
+            # fallback на OpenAI
+            try:
+                ai_pois = await find_poi_ai(query=q, city=city, limit=limit, country_hint="Россия")
+            except Exception:
+                ai_pois = []
+            if ai_pois:
+                LAST_POI = [{
+                    "name": p.get("name",""),
+                    "lat": float(p["lat"]) if p.get("lat") is not None else None,
+                    "lon": float(p["lon"]) if p.get("lon") is not None else None,
+                    "provider": p.get("provider","openai"),
+                    "address": p.get("address",""),
+                } for p in ai_pois if p.get("lat") is not None and p.get("lon") is not None]
 
     pois = LAST_POI or []
     if not pois:
-        await m.answer("Сначала найдите точки: /geo <запрос> [city=...] — или используйте /near_geo R query=…")
+        await m.answer("Сначала найдите точки: /geo <запрос> [city=…] — или используйте /near_geo R query=…")
         return
 
     await m.answer(f"🧭 Подбираю экраны в радиусе {radius_km} км вокруг {len(pois)} точек…")
 
-    # Экраны вокруг всех POI
+    # экраны вокруг всех POI
     frames = []
     for p in pois:
         df = find_within_radius(SCREENS, (p["lat"], p["lon"]), radius_km)
         if df is not None and not df.empty:
             df = df.copy()
-            df["poi_name"] = p["name"]
-            df["poi_lat"]  = p["lat"]
-            df["poi_lon"]  = p["lon"]
+            df["poi_name"] = p.get("name","")
+            df["poi_lat"]  = p.get("lat")
+            df["poi_lon"]  = p.get("lon")
             frames.append(df)
 
     if not frames:
@@ -1247,13 +1263,63 @@ async def cmd_near_geo(m: types.Message):
 
     res = pd.concat(frames, ignore_index=True)
 
-    # Дедуп по screen_id
+    # ---- НОВОЕ: применяем фильтры по формату/владельцу/прочим ----
+    # Если у тебя есть apply_filters/parse_kwargs — используем их
+    filter_kwargs = {}
+    for k in ("format", "owner", "type", "placement", "installation", "city"):
+        if k in kv and kv[k]:
+            filter_kwargs[k] = kv[k]
+    if filter_kwargs:
+        try:
+            # предпочтительно: твоя функция умного парсинга (поддержка A,B | A;B | A|B, алиасы и т.п.)
+            res = apply_filters(res, filter_kwargs)
+        except Exception:
+            # fallback: простая фильтрация
+            if "format" in filter_kwargs and "format" in res.columns:
+                fmts = re.split(r"[;,|]", filter_kwargs["format"])
+                fmts = [f.strip().lower() for f in fmts if f.strip()]
+                if fmts:
+                    res = res[res["format"].astype(str).str.lower().isin(fmts)]
+            if "owner" in filter_kwargs and "owner" in res.columns:
+                owners = re.split(r"[;,|]", filter_kwargs["owner"])
+                owners = [o.strip().lower() for o in owners if o.strip()]
+                if owners:
+                    mask = False
+                    col = res["owner"].astype(str).str.lower()
+                    for o in owners:
+                        mask = mask | col.str.contains(o, na=False)
+                    res = res[mask]
+            if "city" in filter_kwargs and "city" in res.columns:
+                c = filter_kwargs["city"].strip().lower()
+                res = res[res["city"].astype(str).str.lower() == c]
+
+    if res.empty:
+        await m.answer("После применения фильтров ничего не осталось. Попробуйте ослабить условия.")
+        return
+
+    # удаляем дубликаты экранов при необходимости
     if dedup and "screen_id" in res.columns:
         res = res.drop_duplicates(subset=["screen_id"]).reset_index(drop=True)
 
     LAST_RESULT = res
 
-    # Человекочитаемый список (усечём)
+    # если запросили конкретные поля — компактный CSV
+    if fields_req:
+        cols = [c.strip() for c in fields_req.split(",") if c.strip()]
+        cols = [c for c in cols if c in res.columns]
+        if not cols:
+            await m.answer("Поля не распознаны. Доступные: " + ", ".join(res.columns))
+            return
+        view = res[cols].copy()
+        csv_bytes = view.to_csv(index=False).encode("utf-8-sig")
+        await bot.send_document(
+            m.chat.id,
+            types.BufferedInputFile(csv_bytes, filename="near_geo_selection.csv"),
+            caption=f"Экраны рядом с найденными POI (поля: {', '.join(cols)})"
+        )
+        return
+
+    # человекочитаемый список (усекать, чтобы не словить “message is too long”)
     lines = []
     show = res.head(20)
     for _, r in show.iterrows():
@@ -1263,64 +1329,23 @@ async def cmd_near_geo(m: types.Message):
         poi = r.get("poi_name","")
         dist = r.get("distance_km", "")
         lines.append(f"• {r.get('screen_id','')} — {nm} [{fmt}/{own}] — {dist} км от «{poi}»")
+
     await send_lines(
-        m,
-        lines,
+        m, lines,
         header=f"Найдено {len(res)} экранов рядом с {len(pois)} точками (радиус {radius_km} км)",
         chunk=60
     )
 
-    # ====== Выдача файлов ======
+    # полный CSV
     try:
-        # Если запросили поля — подготовим отдельное "вид" представление
-        if fields_req:
-            cols = [c.strip() for c in fields_req.split(",") if c.strip()]
-            cols = [c for c in cols if c in res.columns]
-            if not cols:
-                await m.answer("Поля не распознаны. Доступные: " + ", ".join(res.columns))
-                return
-            view = res[cols].copy()
-
-            # CSV (view)
-            csv_bytes = view.to_csv(index=False).encode("utf-8-sig")
-            await bot.send_document(
-                m.chat.id,
-                BufferedInputFile(csv_bytes, filename="near_geo_selection.csv"),
-                caption=f"Экраны рядом с POI (поля: {', '.join(cols)}) — {len(view)} строк (CSV)"
-            )
-
-            # XLSX (view)
-            xbuf = _io.BytesIO()
-            with pd.ExcelWriter(xbuf, engine="openpyxl") as w:
-                view.to_excel(w, index=False, sheet_name="near_geo")
-            xbuf.seek(0)
-            await bot.send_document(
-                m.chat.id,
-                BufferedInputFile(xbuf.getvalue(), filename="near_geo_selection.xlsx"),
-                caption=f"Экраны рядом с POI (поля: {', '.join(cols)}) — {len(view)} строк (XLSX)"
-            )
-
-        # Полный CSV
-        csv_full = res.to_csv(index=False).encode("utf-8-sig")
+        csv_bytes = res.to_csv(index=False).encode("utf-8-sig")
         await bot.send_document(
             m.chat.id,
-            BufferedInputFile(csv_full, filename="near_geo_full.csv"),
+            types.BufferedInputFile(csv_bytes, filename="near_geo_full.csv"),
             caption=f"Полный список {len(res)} экранов (CSV)"
         )
-
-        # Полный XLSX
-        xbuf_full = _io.BytesIO()
-        with pd.ExcelWriter(xbuf_full, engine="openpyxl") as w:
-            res.to_excel(w, index=False, sheet_name="near_geo_full")
-        xbuf_full.seek(0)
-        await bot.send_document(
-            m.chat.id,
-            BufferedInputFile(xbuf_full.getvalue(), filename="near_geo_full.xlsx"),
-            caption=f"Полный список {len(res)} экранов (XLSX)"
-        )
-
-    except Exception as e:
-        await m.answer(f"⚠️ Не удалось отправить файлы: {e}")
+    except Exception:
+        pass
 
 dp.include_router(geo_router)
 
