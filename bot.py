@@ -149,6 +149,63 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 
+# --- тестовые и диагностические хэндлеры ---
+
+@router.message(Command("start"))
+async def start_cmd(m: types.Message):
+    await m.answer("Я на месте. Попробуй /cache_info")
+
+@router.message(Command("ping"))
+async def ping_cmd(m: types.Message):
+    await m.answer("pong")
+
+# Твой основной хэндлер команды
+@router.message(Command("cache_info"))
+async def cache_info(m: types.Message):
+    try:
+        lines = [
+            f"CACHE_DIR: {CACHE_DIR}",
+            f"exists: {CACHE_DIR.exists()}",
+            f"writable: {os.access(CACHE_DIR, os.W_OK)}",
+            f"CACHE_CSV exists: {CACHE_CSV.exists()}",
+            f"CACHE_META exists: {CACHE_META.exists()}",
+            f"diag: {_cache_diag()}",
+        ]
+        await m.answer("\n".join(lines))
+    except Exception as e:
+        await m.answer(f"cache_info error: {e}")
+
+# Дублируем матчинг на всякий случай (в группах/с упоминанием бота)
+@router.message(F.text.func(lambda t: isinstance(t, str) and t.strip().startswith(("/cache_info", "/cache_info@"))))
+async def cache_info_fallback(m: types.Message):
+    await cache_info(m)
+
+# Ловим все остальные апдейты и логируем, чтобы понимать, что именно «не handled»
+@router.message()
+async def _log_unhandled_messages(m: types.Message):
+    logging.info(f"Unhandled message caught by router: "
+                 f"type={m.content_type}, chat={m.chat.type}, text={getattr(m, 'text', None)!r}")
+
+@router.chat_member()   # сервисные события (добавили/кикнули бота и т.п.)
+async def _log_chat_member(ev: types.ChatMemberUpdated):
+    logging.info(f"ChatMember update: chat={ev.chat.id}, old={ev.old_chat_member.status}, new={ev.new_chat_member.status}")
+
+async def main():
+    try:
+        load_screens_cache()
+    except Exception as e:
+        logging.warning(f"Не удалось загрузить кэш на старте: {e}")
+
+    # Подсказки команд
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Проверка, что бот жив"),
+        BotCommand(command="ping", description="Проверка ответа"),
+        BotCommand(command="cache_info", description="Диагностика кэша"),
+    ])
+
+    await dp.start_polling(bot)
+
 @router.message(Command("cache_info"))
 async def cache_info(m: Message):
     try:
