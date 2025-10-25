@@ -7149,6 +7149,74 @@ async def cmd_sync_api(m: types.Message, _call_args: dict | None = None):
     except Exception:
         await m.answer(f"✅ Инвентарь обновлён: {len(SCREENS)} строк" + (f" (limit={limit})" if limit else ""))
 
+
+# === ФУНКЦИЯ ПОДТЯГИВАНИЯ ДАННЫХ ИЗ API ===
+import aiohttp
+import pandas as pd
+import os
+
+INVENTORY_API_URL = os.getenv("OBDSP_BASE", "").strip()
+INVENTORY_API_TOKEN = os.getenv("OBDSP_TOKEN", "").strip()
+
+async def _sync_api_pull(city=None, formats=None, owners=None):
+    """
+    Загружает инвентарь из внешнего API Omni360 / DSP.
+    Возвращает pandas.DataFrame с колонками: screen_id, name, lat, lon, city, format, owner.
+    """
+    if not INVENTORY_API_URL:
+        raise RuntimeError("INVENTORY_API_URL не задан в .env")
+
+    params = {}
+    if city:
+        params["city"] = city
+    if formats:
+        params["formats"] = ",".join(formats)
+    if owners:
+        params["owners"] = ",".join(owners)
+
+    headers = {}
+    if INVENTORY_API_TOKEN:
+        headers["Authorization"] = f"Bearer {INVENTORY_API_TOKEN}"  # если требуется авторизация
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(INVENTORY_API_URL, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"API вернул статус {resp.status}")
+            data = await resp.json()
+
+    # API может вернуть список или {"items": [...]} — обрабатываем оба варианта
+    items = data.get("items") if isinstance(data, dict) and "items" in data else data
+    if not items:
+        return pd.DataFrame()
+
+    # Преобразуем список словарей в DataFrame
+    df = pd.DataFrame(items)
+
+    # Унификация названий колонок
+    rename_map = {
+        "id": "screen_id",
+        "screenId": "screen_id",
+        "title": "name",
+        "latitude": "lat",
+        "longitude": "lon",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    # Добавляем недостающие поля
+    for col in ["screen_id", "name", "lat", "lon", "city", "format", "owner"]:
+        if col not in df.columns:
+            df[col] = None
+
+    # Чистим и приводим типы
+    try:
+        df["lat"] = df["lat"].astype(float)
+        df["lon"] = df["lon"].astype(float)
+    except Exception:
+        pass
+
+    return df[["screen_id", "name", "lat", "lon", "city", "format", "owner"]]
+
+
 @dp.message(Command("pick_city"))
 async def pick_city(m: types.Message, _call_args: dict | None = None):
     """
