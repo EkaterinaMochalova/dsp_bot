@@ -747,30 +747,20 @@ router = Router()
 
 # ---------- NLU-подсказки по свободному тексту ----------
 import re
+from aiogram import Router, F, types
+from aiogram.filters import Command
 from aiogram.utils.text_decorations import html_decoration as hd
 
-@nlu_router.message(F.text & ~F.via_bot)
-async def natural_language_assistant(m: types.Message):
-    text = (m.text or "").strip()
-    cmd, hint = suggest_command_from_text(text)
-    if cmd:
-        await m.answer(
-            f"Похоже, вы хотите это:\n\n<b>Советую команду</b> 👉 <code>{cmd}</code>\n\n<i>{hd.quote(hint)}</i>",
-            parse_mode="HTML"
-        )
-    else:
-        await m.answer(
-            f"{hd.quote(hint)}\n\n"
-            "А пока можно посмотреть доступные команды: /help",
-            parse_mode="HTML"
-        )
+# если уже объявлен где-то выше — используй его; иначе раскомментируй следующую строку
+# nlu_router = Router(name="nlu")
 
+# ⛔️ Критично: NLU никогда не обрабатывает команды вида /help, /plan и пр.
+# Работает только с "обычным текстом" и не трогает сообщения от ботов.
+nlu_router.message.filter(~Command(), F.text, ~F.via_bot)
 
-dp.include_router(nlu_router)
-
-# Нормализация чисел типа "200к", "1.5м"
+# --- Нормализация чисел типа "200к", "1.5м" ---
 def _parse_money(s: str) -> float | None:
-    s = s.lower().replace(" ", "")
+    s = (s or "").lower().replace(" ", "")
     m = re.findall(r"[\d]+(?:[.,]\d+)?", s)
     if not m:
         return None
@@ -782,12 +772,12 @@ def _parse_money(s: str) -> float | None:
     return val
 
 def _parse_int(s: str) -> int | None:
-    m = re.search(r"\b(\d{1,6})\b", s)
+    m = re.search(r"\b(\d{1,6})\b", s or "")
     return int(m.group(1)) if m else None
 
 def _extract_city(text: str) -> str | None:
-    # очень простой хак: слова после "в " или "по " до конца/цифры/знака препинания
-    m = re.search(r"(?:в|по)\s+([А-ЯA-ZЁ][\w\- ]{2,})", text, flags=re.IGNORECASE)
+    # простой хак: слова после "в " или "по " до конца/цифры/знака препинания
+    m = re.search(r"(?:в|по)\s+([А-ЯA-ZЁ][\w\- ]{2,})", text or "", flags=re.IGNORECASE)
     if not m:
         return None
     cand = m.group(1).strip()
@@ -795,7 +785,7 @@ def _extract_city(text: str) -> str | None:
     return cand if len(cand) >= 2 else None
 
 def _extract_latlon(text: str):
-    m = re.search(r"(-?\d{1,2}\.\d+)[, ]+(-?\d{1,3}\.\d+)", text)
+    m = re.search(r"(-?\d{1,2}\.\d+)[, ]+(-?\d{1,3}\.\d+)", text or "")
     if m:
         try:
             return float(m.group(1)), float(m.group(2))
@@ -804,11 +794,11 @@ def _extract_latlon(text: str):
     return None
 
 def _has_any(text: str, words: list[str]) -> bool:
-    t = text.lower()
+    t = (text or "").lower()
     return any(w in t for w in words)
 
 def _extract_formats(text: str) -> list[str]:
-    t = text.lower()
+    t = (text or "").lower()
     fmts = []
     if "billboard" in t or "билбор" in t or "биллбор" in t:
         fmts.append("billboard")
@@ -816,26 +806,26 @@ def _extract_formats(text: str) -> list[str]:
         fmts.append("supersite")
     if "city" in t or "сити" in t or "гид" in t:
         fmts.append("city")
-    # можно расширить по мере надобности
     return fmts
 
 def _extract_owners(text: str) -> list[str]:
-    # ключевые слова "владелец", "оператор", "owner" + слово(а) после
-    m = re.search(r"(?:owner|владелец|оператор)[=: ]+([^\n,;]+)", text, flags=re.IGNORECASE)
+    m = re.search(r"(?:owner|владелец|оператор)[=: ]+([^\n,;]+)", text or "", flags=re.IGNORECASE)
     if not m:
         return []
     vals = re.split(r"[;,\| ]+", m.group(1).strip())
     return [v for v in vals if v]
 
 def suggest_command_from_text(text: str) -> tuple[str | None, str]:
-    t = text.strip()
+    t = (text or "").strip()
     low = t.lower()
 
     # 1) /plan — бюджет, дни, n, город, форматы, "самые охватные"
     if _has_any(low, ["план", "спланируй", "на бюджет", "под бюджет", "кампан", "распред", "показы"]):
         budget = _parse_money(low) or 200_000
         n = _parse_int(low) or 10
-        days = _parse_int(re.sub(r".*?(\d+)\s*дн", r"\1", low)) or 10
+        # попытка вытащить "10 дней" из текста; если не нашли — 10
+        m_days = re.search(r"(\d+)\s*дн", low)
+        days = int(m_days.group(1)) if m_days else 10
         city = _extract_city(t) or "Москва"
         fmts = _extract_formats(low)
         owners = _extract_owners(t)
@@ -877,27 +867,27 @@ def suggest_command_from_text(text: str) -> tuple[str | None, str]:
         parts = []
         if city: parts.append(f"city={city}")
         if fmts: parts.append(f"formats={','.join(fmts)}")
-        base = " /sync_api " + " ".join(parts) if parts else " /sync_api size=500 pages=3"
+        base = "/sync_api " + " ".join(parts) if parts else "/sync_api size=500 pages=3"
         return base.strip(), "Синхронизация инвентаря из API"
 
     # 6) /shots — фотоотчёт по кампании
     if _has_any(low, ["фотоотчет", "фото отчёт", "кадры кампании", "impression", "shots"]):
         camp = _parse_int(low) or 0
         if camp > 0:
-            return f"/shots campaign={camp} per=0 limit=100", "Фотоотчет по кампании"
+            return f"/shots campaign={camp} per=0 limit=100", "Фотоотчёт по кампании"
         else:
-            return "/shots campaign=<ID> per=0 limit=100", "Фотоотчет: укажите campaign ID"
+            return "/shots campaign=<ID> per=0 limit=100", "Фотоотчёт: укажите campaign ID"
 
-    # 7) /export_last
+    # 7) /export_last — экспорт
     if _has_any(low, ["выгрузи", "экспорт", "csv", "xlsx", "таблица"]):
         return "/export_last", "Экспорт последней выборки"
 
-    # 8) /radius
+    # 8) /radius — изменить радиус
     if _has_any(low, ["радиус", "поставь радиус", "изменить радиус"]):
         r = _parse_int(low) or 2
         return f"/radius {r}", "Задать радиус по умолчанию (км)"
 
-    # 9) /status /help
+    # 9) /status и /help
     if _has_any(low, ["статус", "что загружено", "сколько экранов"]):
         return "/status", "Статус загруженных данных"
     if _has_any(low, ["help", "помощ", "что умеешь", "команды"]):
@@ -906,7 +896,24 @@ def suggest_command_from_text(text: str) -> tuple[str | None, str]:
     # Не нашли понятного соответствия
     return None, "Похоже, готовой команды для этого нет. Напишите, пожалуйста, @enterspring — он поможет добавить нужную функцию."
 
+@nlu_router.message()
+async def natural_language_assistant(m: types.Message):
+    text = (m.text or "").strip()
+    cmd, hint = suggest_command_from_text(text)
+    if cmd:
+        await m.answer(
+            f"Похоже, вы хотите это:\n\n<b>Советую команду</b> 👉 <code>{cmd}</code>\n\n<i>{hd.quote(hint)}</i>",
+            parse_mode="HTML"
+        )
+    else:
+        await m.answer(
+            f"{hd.quote('Похоже, готовой команды для этого нет. Напишите, пожалуйста, @enterspring — она поможет добавить нужную функцию.')}\n\n"
+            "А пока можно посмотреть доступные команды: /help",
+            parse_mode="HTML"
+        )
 
+# Подключение NLU-роутера ДОЛЖНО быть выше, чем основной:
+dp.include_router(nlu_router)
 
 # ---------- базовые команды ----------
 @router.message(Command("start"))
