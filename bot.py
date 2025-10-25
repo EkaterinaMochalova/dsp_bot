@@ -2200,6 +2200,89 @@ def _build_server_query(filters: dict | None) -> dict:
 
     # выкинем пустые
     return {k: v for k, v in q.items() if v not in ("", None, [], {})}
+async def _fetch_inventories(
+    pages_limit: int | None = None,
+    page_size: int = 500,
+    total_limit: int | None = None,
+    m: types.Message | None = None,
+    filters: dict | None = None,          # <--- НОВОЕ
+) -> list[dict]:
+    """
+    /api/v1.0/clients/inventories — тянем постранично.
+    Параметры:
+      - pages_limit: максимум страниц (None = все)
+      - page_size:   размер страницы
+      - total_limit: общий лимит элементов (None = без ограничений)
+      - m:           Telegram message для прогресса
+      - filters:     { city: str, formats: [..], owners: [..], api_params: {rawKey: rawVal} }
+    """
+    base = (OBDSP_BASE or "https://proddsp.omniboard360.io").rstrip("/")
+    root = f"{base}/api/v1.0/clients/inventories"
+
+    headers = {
+        "Authorization": f"Bearer {OBDSP_TOKEN}",
+        "Accept": "application/json",
+    }
+
+    timeout = aiohttp.ClientTimeout(total=180)
+    ssl_param = _make_ssl_param_for_aiohttp()
+
+    # подготовим серверные query-параметры (они будут добавляться к page/size)
+    server_q = _build_server_query(filters)
+
+    items: list[dict] = []
+    page = 0
+    pages_fetched = 0
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            params = {"page": page, "size": page_size}
+            # добавляем серверные фильтры
+            for k, v in server_q.items():
+                params[k] = v
+
+            async with session.get(root, headers=headers, params=params, ssl=ssl_param) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    raise RuntimeError(f"API {resp.status}: {text[:300]}")
+
+                try:
+                    data = await resp.json()
+                except Exception:
+                    raise RuntimeError(f"Не удалось распарсить JSON: {text[:500]}")
+
+                page_items = data.get("content") or []
+                items.extend(page_items)
+
+                pages_fetched += 1
+                page += 1
+
+                # лимит по общему количеству
+                if total_limit is not None and len(items) >= total_limit:
+                    items = items[:total_limit]
+                    break
+
+                # лимит по страницам
+                if pages_limit is not None and pages_fetched >= pages_limit:
+                    break
+
+                # признаки окончания
+                if data.get("last") is True:
+                    break
+                if data.get("totalPages") is not None and page >= int(data["totalPages"]):
+                    break
+                if data.get("numberOfElements") == 0:
+                    break
+
+                # прогресс
+                if m and (pages_fetched % 5 == 0):
+                    try:
+                        await m.answer(f"…загружено страниц: {pages_fetched}, всего позиций: {len(items)}")
+                    except Exception:
+                        pass
+
+    return items
+
 
 def _normalize_format_token(tok: str) -> str:
     if not tok:
