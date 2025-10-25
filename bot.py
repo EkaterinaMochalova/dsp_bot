@@ -19,6 +19,61 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile  # для отправки файлов из памяти
 
+# ==== вверху файла один раз ====
+import os, json, time, logging
+from pathlib import Path
+import pandas as pd
+
+BASE_DIR = Path(__file__).resolve().parent
+CACHE_DIR = BASE_DIR / "data"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+CACHE_CSV  = CACHE_DIR / "screens_cache.csv"
+CACHE_META = CACHE_DIR / "screens_cache.meta.json"
+
+def save_screens_cache(df: pd.DataFrame):
+    """Сохраняет кэш на диск (CSV + meta). Возвращает True/False."""
+    global LAST_SYNC_TS
+    try:
+        if df is None or df.empty:
+            return False
+
+        # только CSV
+        df.to_csv(CACHE_CSV, index=False, encoding="utf-8-sig")
+
+        LAST_SYNC_TS = time.time()
+        meta = {"ts": LAST_SYNC_TS, "rows": int(len(df))}
+        CACHE_META.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        logging.info(f"💾 Кэш сохранён: {len(df)} строк → {CACHE_CSV}")
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка при сохранении кэша: {e}")
+        return False
+
+def load_screens_cache() -> bool:
+    """Пытается поднять инвентарь из CSV. Возвращает True/False."""
+    global SCREENS, LAST_SYNC_TS
+    try:
+        if not CACHE_CSV.exists():
+            return False
+        df = pd.read_csv(CACHE_CSV)
+        if df is None or df.empty:
+            return False
+        SCREENS = df
+
+        if CACHE_META.exists():
+            meta = json.loads(CACHE_META.read_text(encoding="utf-8"))
+            LAST_SYNC_TS = float(meta.get("ts")) if "ts" in meta else None
+        else:
+            LAST_SYNC_TS = None
+
+        logging.info(f"Loaded screens cache: {len(SCREENS)} rows, ts={LAST_SYNC_TS}")
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка при загрузке кэша: {e}")
+        return False
+
 
 def _ssl_ctx_certifi() -> ssl.SSLContext:
     """Создаёт безопасный SSL-контекст с CA из certifi, если доступен."""
