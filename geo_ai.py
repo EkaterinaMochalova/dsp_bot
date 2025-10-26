@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 import os, json, math, asyncio
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
 import aiohttp
 
 OPENAI_URL   = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -14,8 +14,8 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # bbox России (грубо): (min_lon, min_lat, max_lon, max_lat)
 RUSSIA_BBOX: Tuple[float, float, float, float] = (19.0, 41.0, 190.0, 82.0)
 
-# Тип обратного геокодера адреса -> (lat, lon) | None
-GeocodeBackfill = Callable[str], "asyncio.Future[Optional[Tuple[float, float]]]]"
+# Тип для опционального догеокодера: принимает строку адреса и возвращает (lat, lon) асинхронно
+GeocodeBackfill = Callable[[str], Awaitable[Optional[Tuple[float, float]]]]
 
 SYSTEM_PROMPT = (
     "You are a strict geocoding assistant. "

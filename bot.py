@@ -5,6 +5,7 @@ from datetime import datetime
 import random
 from typing import Any
 from geo_ai import find_poi_ai
+from geo_ai import find_poi_ai
 
 import pandas as pd
 import aiohttp
