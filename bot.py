@@ -1178,9 +1178,9 @@ async def cmd_geo(m: types.Message):
     """
     /geo <запрос> [city=...] [limit=...] [provider=openai|nominatim|auto]
     Примеры:
-      /geo Твой дом city=Москва limit=5
+      /geo Твой дом city=Москва
       /geo новостройки бизнес-класса city=Воронеж
-      /geo аптека 36.6 city=Москва provider=openai
+      /geo якитория city=Москва provider=openai
     """
     global LAST_POI
     text = (m.text or "").strip()
@@ -1189,7 +1189,7 @@ async def cmd_geo(m: types.Message):
         await m.answer("Формат: /geo <запрос> [city=...] [limit=5] [provider=openai|nominatim|auto]")
         return
 
-    # Парсинг: позиционный запрос + key=value
+    # --- парсинг ---
     query_tokens, kv = [], {}
     for p in parts:
         if "=" in p:
@@ -1199,7 +1199,7 @@ async def cmd_geo(m: types.Message):
             query_tokens.append(p)
     query = " ".join(query_tokens).strip()
     if not query:
-        await m.answer("Нужен текст запроса. Пример: /geo Твой дом city=Москва limit=5")
+        await m.answer("Нужен текст запроса. Пример: /geo Твой дом city=Москва")
         return
 
     city = kv.get("city")
@@ -1207,39 +1207,76 @@ async def cmd_geo(m: types.Message):
         limit = int(kv.get("limit", "5") or 5)
     except Exception:
         limit = 5
-    provider = (kv.get("provider") or "").lower().strip()
+    provider = (kv.get("provider") or "auto").lower()  # auto = OpenAI → Nominatim
 
-    # Если провайдер не указан — показываем выбор кнопками
-    if provider not in {"openai", "nominatim", "auto"}:
-        uid = uuid.uuid4().hex[:12]
-        GEO_PENDING[uid] = {"query": query, "city": city, "limit": limit}
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🧠 OpenAI (шире, но может фантазировать)", callback_data=f"geo_provider:{uid}:openai"),
-            ],
-            [
-                InlineKeyboardButton(text="🌍 Nominatim (OSM, точнее, но меньше)", callback_data=f"geo_provider:{uid}:nominatim"),
-            ],
-            [
-                InlineKeyboardButton(text="🤝 Авто (OpenAI → Nominatim)", callback_data=f"geo_provider:{uid}:auto"),
-            ],
-        ])
-        await m.answer(
-            f"🔎 Ищу точки по запросу «{query}»" + (f" в городе {city}" if city else "") + "…\n\n"
-            "Выберите провайдера:",
-            reply_markup=kb
-        )
-        return
+    await m.answer(f"🔎 Ищу точки «{query}»" + (f" в {city}" if city else "") + (f" через {provider}…" if provider != "auto" else "…"))
 
-    # Провайдер указан — сразу ищем
-    await m.answer(f"🔎 Ищу точки «{query}»" + (f" в {city}" if city else "") + f" через {provider}…")
-    pois, label = await _run_geo_search(query=query, city=city, limit=limit, provider=provider)
-    if label:
-        await m.answer(label)
+    pois = []
+
+    # --- 1) сначала OpenAI (если openai или auto) ---
+    openai_tried = False
+    if provider in ("openai", "auto"):
+        openai_tried = True
+        try:
+            try:
+                from geo_ai import find_poi_ai, RUSSIA_BBOX
+                pois = await find_poi_ai(query=query, city=city, limit=limit, bbox=RUSSIA_BBOX)
+            except Exception:
+                from geo_ai import find_poi_ai
+                pois = await find_poi_ai(query=query, city=city, limit=limit)
+            await m.answer(f"🧠 OpenAI ({len(pois)} точек)")
+        except Exception as e:
+            await m.answer(f"⚠️ OpenAI не сработал ({e}).")
+
+    # --- 2) фолбэк на Nominatim (всегда, если пусто) ---
+    if not pois and (provider in ("nominatim", "auto", "openai")):
+        try:
+            alt = await geocode_query(query, city=city, limit=limit, provider="nominatim")
+            if alt:
+                pois = alt
+                await m.answer(f"🌍 Нашёл через Nominatim ({len(pois)} точек).")
+        except Exception as e:
+            # если прям всё плохо — сообщим и выйдем
+            if not openai_tried:
+                await m.answer(f"🚫 Геокодер ответил ошибкой: {e}")
+
     if not pois:
-        await m.answer("Ничего не нашёл. Попробуйте другой провайдер или уточните запрос.")
+        await m.answer("Ничего не нашёл. Попробуйте другой провайдер: `provider=nominatim` или уточните запрос.", parse_mode=None)
         return
-    await _send_geo_results(m, pois, query)
+
+    LAST_POI = pois
+
+    # --- превью (не растекаемся по TL) ---
+    lines = []
+    for i, p in enumerate(pois[:15], 1):
+        addr = p.get("address") or ""
+        pr = p.get("provider", "")
+        lines.append(
+            f"{i}. {p['name']}" + (f", {addr}" if addr else "") +
+            f"\n   [{p['lat']:.6f}, {p['lon']:.6f}] ({pr})"
+        )
+
+    msg = (
+        f"📍 Найденные точки: всего {len(pois)}\n"
+        f"(показано {len(lines)}; полный список — в CSV)\n\n" + "\n".join(lines)
+    )
+    await m.answer(msg)
+
+    # --- CSV со всеми результатами ---
+    try:
+        import pandas as pd
+        from aiogram.types import BufferedInputFile
+        df = pd.DataFrame(pois)
+        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+        await bot.send_document(
+            m.chat.id,
+            BufferedInputFile(csv_bytes, filename="geo_points.csv"),
+            caption=f"Точки по запросу «{query}» ({len(pois)} шт.)"
+        )
+    except Exception:
+        pass
+
+    await m.answer("Теперь можно: /near_geo 2 — подобрать экраны рядом.")
 
 
 @geo_router.callback_query(F.data.startswith("geo_provider:"))
@@ -1272,7 +1309,7 @@ async def geo_provider_choice(c: types.CallbackQuery):
 
     await _send_geo_results(c.message, pois, query)
     await c.answer()
-    
+
 # ---------- /near_geo (в том же geo_router) ----------
 @geo_router.message(Command("near_geo"))
 async def cmd_near_geo(m: types.Message):
