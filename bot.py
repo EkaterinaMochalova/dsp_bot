@@ -1192,6 +1192,11 @@ try:
 except Exception:
     find_poi_ai = None
 
+from aiogram import types
+from aiogram.filters import Command
+import pandas as pd
+from aiogram.types import BufferedInputFile
+
 @geo_router.message(Command("geo"))
 async def cmd_geo(m: types.Message):
     """
@@ -1201,13 +1206,14 @@ async def cmd_geo(m: types.Message):
       /geo стадион city=Химки provider=overpass
     """
     global LAST_POI
+
     text = (m.text or "").strip()
     parts = text.split()[1:]
     if not parts:
         await m.answer("Формат: /geo <запрос> [city=...] [limit=5] [provider=auto|nominatim|overpass|openai]")
         return
 
-    # parse
+    # --- разбор аргументов ---
     query_tokens, kv = [], {}
     for p in parts:
         if "=" in p:
@@ -1222,53 +1228,86 @@ async def cmd_geo(m: types.Message):
 
     city = kv.get("city")
     try:
-        limit = int(kv.get("limit", "5") or 5)
+        limit = max(1, int(kv.get("limit", "5") or 5))
     except Exception:
         limit = 5
     provider = (kv.get("provider") or "auto").lower()
+    if provider not in {"auto", "nominatim", "overpass", "openai"}:
+        provider = "auto"
 
-    await m.answer(f"🔎 Ищу точки «{query}»" + (f" в {city}" if city else "") + f" через {provider}…")
+    await m.answer(f"🔎 Ищу точки «{query}»" + (f" в {city}" if city else "") + (f" через {provider}…" if provider != "auto" else "…"))
 
-    pois = []
-
+    # --- утилиты ---
     def _is_category(q: str) -> bool:
-        ql = q.lower()
-        return any(x in ql for x in ["аптека","стадион","тц","торгов","школ","парк","вокзал","аэропорт","жк","новострой"])
+        ql = (q or "").lower()
+        # расширяем по мере необходимости
+        return any(x in ql for x in [
+            "аптека","стадион","тц","торгов","школ","садик","парк","вокзал",
+            "аэропорт","жк","новострой","университет","вуз","больниц","поликлиник",
+            "бизнес-центр","бц","мфц","театр","музей","цирк","рынок"
+        ])
 
     async def _send(pois_list):
-    global LAST_POI  # ← вместо nonlocal
-    LAST_POI = pois_list
-    shown = pois_list[:15]
-    lines = []
-    for i, p in enumerate(shown, 1):
-        addr = p.get("address") or ""
-        pr = p.get("provider", "")
-        lines.append(f"{i}. {p['name']}" + (f", {addr}" if addr else "") + f"\n   [{p['lat']:.6f}, {p['lon']:.6f}] ({pr})")
-    await m.answer(
-        f"📍 Найденные точки: всего {len(pois_list)}\n"
-        f"(показано {len(shown)}; полный список — в CSV)\n\n" + ("\n".join(lines) if lines else "—")
-    )
-    try:
-        df = pd.DataFrame(pois_list)
-        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-        await m.answer_document(
-            BufferedInputFile(csv_bytes, filename="geo_points.csv"),
-            caption=f"Точки «{query}» ({len(pois_list)} шт.)"
+        """Сохраняем найденные точки, шлём короткий список + CSV."""
+        global LAST_POI
+        LAST_POI = pois_list or []
+
+        total = len(LAST_POI)
+        shown = LAST_POI[:15]  # чтобы не упираться в лимит длины сообщения
+        lines = []
+        for i, p in enumerate(shown, 1):
+            name = p.get("name") or ""
+            addr = p.get("address") or ""
+            pr   = p.get("provider") or ""
+            lat  = p.get("lat"); lon = p.get("lon")
+            lines.append(
+                f"{i}. {name}" + (f", {addr}" if addr else "") +
+                (f"\n   [{lat:.6f}, {lon:.6f}] ({pr})" if lat is not None and lon is not None else "")
+            )
+
+        body = (
+            f"📍 Найденные точки: всего {total}\n"
+            f"(показано {len(shown)}; полный список — в CSV)\n\n" +
+            ("\n".join(lines) if lines else "—")
         )
+        await m.answer(body)
+
+        # CSV целиком
+        try:
+            df = pd.DataFrame(LAST_POI)
+            csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+            await m.answer_document(
+                BufferedInputFile(csv_bytes, filename="geo_points.csv"),
+                caption=f"Точки «{query}» ({total} шт.)"
+            )
+        except Exception:
+            pass
+
+        await m.answer("Теперь можно: /near_geo 2 — подобрать экраны рядом.")
+
+    # --- реализация поиска с провайдерами ---
+    pois = []
+
+    # Пытаемся аккуратно импортировать OpenAI-поиск (может отсутствовать)
+    try:
+        from geo_ai import find_poi_ai
     except Exception:
-        pass
-    await m.answer("Теперь можно: /near_geo 2 — подобрать экраны рядом.")
+        find_poi_ai = None  # type: ignore
 
     try:
         if provider == "nominatim":
             pois = await geocode_query(query, city=city, limit=limit)
             await m.answer(f"🌍 Nominatim ({len(pois)} точек)")
-            if pois: return await _send(pois)
+            if pois:
+                await _send(pois)
+                return
 
         elif provider == "overpass":
             pois = await search_overpass(query, city=city, limit=limit)
             await m.answer(f"🗺️ Overpass ({len(pois)} точек)")
-            if pois: return await _send(pois)
+            if pois:
+                await _send(pois)
+                return
 
         elif provider == "openai":
             if find_poi_ai:
@@ -1276,35 +1315,52 @@ async def cmd_geo(m: types.Message):
             else:
                 pois = []
             await m.answer(f"🧠 OpenAI ({len(pois)} точек)")
-            if pois: return await _send(pois)
+            if pois:
+                await _send(pois)
+                return
 
         else:  # auto
-            # 1) общие категории — сначала Overpass
+            # для категорий: Overpass → Nominatim → OpenAI
+            # для брендов/названий: Nominatim → Overpass → OpenAI
             if _is_category(query):
                 pois = await search_overpass(query, city=city, limit=limit)
                 await m.answer(f"🗺️ Overpass ({len(pois)} точек)")
-                if pois: return await _send(pois)
-                # fallback -> nominatim
+                if pois:
+                    await _send(pois)
+                    return
+
                 pois = await geocode_query(query, city=city, limit=limit)
                 await m.answer(f"🌍 Nominatim ({len(pois)} точек)")
-                if pois: return await _send(pois)
-                # финальный fallback -> openai
+                if pois:
+                    await _send(pois)
+                    return
+
                 if find_poi_ai:
                     pois = await find_poi_ai(query=query, city=city, limit=limit, country_hint="Россия")
                     await m.answer(f"🧠 OpenAI ({len(pois)} точек)")
-                    if pois: return await _send(pois)
+                    if pois:
+                        await _send(pois)
+                        return
             else:
-                # 2) бренды/названия — nominatim -> overpass -> openai
                 pois = await geocode_query(query, city=city, limit=limit)
                 await m.answer(f"🌍 Nominatim ({len(pois)} точек)")
-                if pois: return await _send(pois)
+                if pois:
+                    await _send(pois)
+                    return
+
                 pois = await search_overpass(query, city=city, limit=limit)
                 await m.answer(f"🗺️ Overpass ({len(pois)} точек)")
-                if pois: return await _send(pois)
+                if pois:
+                    await _send(pois)
+                    return
+
                 if find_poi_ai:
                     pois = await find_poi_ai(query=query, city=city, limit=limit, country_hint="Россия")
                     await m.answer(f"🧠 OpenAI ({len(pois)} точек)")
-                    if pois: return await _send(pois)
+                    if pois:
+                        await _send(pois)
+                        return
+
     except Exception as e:
         await m.answer(f"🚫 Ошибка поиска: {e}")
 
