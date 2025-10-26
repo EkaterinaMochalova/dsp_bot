@@ -5,7 +5,6 @@ from datetime import datetime
 import random
 from typing import Any
 from geo_ai import find_poi_ai
-from geo_ai import find_poi_ai
 
 import pandas as pd
 import aiohttp
@@ -117,7 +116,7 @@ HELP = (
     "• /geo <запрос> [city=...] [limit=5] — найти координаты по запросу\n"
     "   Примеры:\n"
     "   /geo Твой дом city=Москва\n"
-    "   /geo Burger King city=Москва limit=15"
+    "   /geo Burger King city=Москва limit=5\n"
     "• /near_geo [R] [fields=...] — подобрать экраны вокруг найденных точек\n"
     "   Примеры:\n"
     "   /near_geo 2\n"
@@ -1064,19 +1063,19 @@ LAST_POI = []
 @geo_router.message(Command("geo"))
 async def cmd_geo(m: types.Message):
     """
-    /geo <запрос> [city=...] [limit=...] [provider=openai|nominatim|google|yandex|2gis]
+    /geo <запрос> [city=...] [limit=...] [provider=nominatim|google|yandex|2gis|openai]
     Примеры:
-      /geo Твой дом city=Москва limit=5
+      /geo Твой дом city=Москва
       /geo новостройки бизнес-класса city=Воронеж
     """
     global LAST_POI
     text = (m.text or "").strip()
     parts = text.split()[1:]
     if not parts:
-        await m.answer("Формат: /geo <запрос> [city=...] [limit=5] [provider=openai]")
+        await m.answer("Формат: /geo <запрос> [city=...] [limit=5] [provider=openai|nominatim]")
         return
 
-    # разбор параметров
+    # --- парсинг ---
     query_tokens, kv = [], {}
     for p in parts:
         if "=" in p:
@@ -1086,7 +1085,7 @@ async def cmd_geo(m: types.Message):
             query_tokens.append(p)
     query = " ".join(query_tokens).strip()
     if not query:
-        await m.answer("Нужен текст запроса. Пример: /geo Твой дом city=Москва limit=5")
+        await m.answer("Нужен текст запроса. Пример: /geo Твой дом city=Москва")
         return
 
     city = kv.get("city")
@@ -1094,80 +1093,62 @@ async def cmd_geo(m: types.Message):
         limit = int(kv.get("limit", "5") or 5)
     except Exception:
         limit = 5
-    provider = (kv.get("provider") or "openai").lower()
+    provider = kv.get("provider", "openai").lower()
 
     await m.answer(f"🔎 Ищу точки по запросу «{query}»" + (f" в городе {city}" if city else "") + "…")
 
     pois = []
 
-    # 🔹 1. Сначала пробуем OpenAI
+    # --- 1. сначала пробуем OpenAI ---
     if provider in ("openai", "auto"):
         try:
-            pois_ai = await find_poi_ai(query=query, city=city, limit=limit, country_hint="Россия")
-            if pois_ai:
-                pois = [{
-                    "name": p.get("name",""),
-                    "lat": float(p["lat"]) if p.get("lat") else None,
-                    "lon": float(p["lon"]) if p.get("lon") else None,
-                    "provider": p.get("provider","openai"),
-                    "address": p.get("address","")
-                } for p in pois_ai if p.get("lat") and p.get("lon")]
-                await m.answer(f"🧠 Нашёл через OpenAI ({len(pois)} точек).")
+            from geo_ai import find_poi_ai, RUSSIA_BBOX
+            pois = await find_poi_ai(query=query, city=city, limit=limit, bbox=RUSSIA_BBOX)
+            if pois:
+                await m.answer(f"🧠 Найдено через OpenAI ({len(pois)} точек).")
         except Exception as e:
-            await m.answer(f"⚠️ Ошибка OpenAI: {e}")
+            await m.answer(f"⚠️ OpenAI не сработал ({e}). Пробую геокодер…")
 
-    # 🔹 2. Если OpenAI ничего не дал — fallback к геокодеру
+    # --- 2. если OpenAI ничего не дал, пробуем стандартный геокодер ---
     if not pois:
         try:
             pois = await geocode_query(query, city=city, limit=limit, provider="nominatim")
             if pois:
                 await m.answer(f"🌍 Нашёл через Nominatim ({len(pois)} точек).")
         except Exception as e:
-            await m.answer(f"⚠️ Геокодер Nominatim вернул ошибку: {e}")
+            await m.answer(f"🚫 Геокодер ответил ошибкой: {e}")
 
     if not pois:
-        await m.answer("❌ Ничего не нашёл. Попробуйте уточнить запрос или увеличить limit.")
+        await m.answer("Ничего не нашёл. Попробуйте уточнить запрос или другой провайдер.")
         return
 
     LAST_POI = pois
 
-    # форматируем вывод
+    # --- вывод ---
     lines = []
-    for i, p in enumerate(pois, 1):
-        addr = (p.get("address") or "").strip()
-        prov = p.get("provider", "")
-        try:
-            lat_s = f"{float(p['lat']):.6f}"
-            lon_s = f"{float(p['lon']):.6f}"
-        except Exception:
-            lat_s, lon_s = str(p.get("lat","")), str(p.get("lon",""))
-        line = f"{i}. {p.get('name','')}" + (f", {addr}" if addr else "") + f"\n   [{lat_s}, {lon_s}] ({prov})"
-        lines.append(line)
+    for i, p in enumerate(pois[:15], 1):  # показываем максимум 15 строк
+        addr = p.get("address") or ""
+        pr = p.get("provider", "")
+        lines.append(f"{i}. {p['name']}" + (f", {addr}" if addr else "") + f"\n   [{p['lat']:.6f}, {p['lon']:.6f}] ({pr})")
 
-    to_show = lines[:100]
-    header = (
-        f"📍 Найденные точки: всего {len(pois)}\n"
-        f"(показано {len(to_show)}; полный список — в CSV)\n\n"
-        "Теперь можно: /near_geo 2  — подобрать экраны рядом"
-    )
-    await send_lines(m, to_show, header=header, chunk=40)
+    msg = f"📍 Найденные точки: всего {len(pois)}\n(показано {len(lines)}; полный список — в CSV)\n\n" + "\n".join(lines)
+    await m.answer(msg)
 
-    # CSV
+    # --- отправим CSV ---
     try:
-        import io, csv
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow(["name", "address", "lat", "lon", "provider"])
-        for p in pois:
-            writer.writerow([p.get("name",""), p.get("address",""), p.get("lat",""), p.get("lon",""), p.get("provider","")])
-        csv_bytes = buf.getvalue().encode("utf-8-sig")
+        import pandas as pd
+        from aiogram.types import BufferedInputFile
+        df = pd.DataFrame(pois)
+        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
         await bot.send_document(
             m.chat.id,
-            types.BufferedInputFile(csv_bytes, filename="geo_pois.csv"),
-            caption=f"Все найденные точки ({len(pois)})"
+            BufferedInputFile(csv_bytes, filename="geo_points.csv"),
+            caption=f"Точки по запросу «{query}» ({len(pois)} шт.)"
         )
-    except Exception as e:
-        await m.answer(f"⚠️ Не удалось отправить CSV: {e}")
+    except Exception:
+        pass
+
+    await m.answer("Теперь можно: /near_geo 2 — подобрать экраны рядом.")
 
 # ---------- /near_geo (в том же geo_router) ----------
 @geo_router.message(Command("near_geo"))
