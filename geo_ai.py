@@ -81,15 +81,6 @@ async def find_poi_ai(
     bbox: Optional[Tuple[float, float, float, float]] = RUSSIA_BBOX,
     geocode_backfill: Optional[GeocodeBackfill] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Возвращает список [{name, address, lat, lon, provider:'openai'}].
-    Анти-галлюцинации:
-      - temperature=0, строгий системный промпт
-      - JSON-only (response_format json_object), парсинг как JSON
-      - фильтр по bbox, дедуп координат
-      - опциональный догеокод адресов (если нужно)
-      - если модель не уверена — [] (просим в промпте)
-    """
     if not OPENAI_KEY:
         return []
 
@@ -99,7 +90,6 @@ async def find_poi_ai(
         f"Return verified GPS coordinates only. If not sure, return []."
     ).strip()
 
-    # Пытаемся заставить строгий JSON через response_format=json_object
     payload = {
         "model": OPENAI_MODEL,
         "messages": [
@@ -108,7 +98,7 @@ async def find_poi_ai(
         ],
         "temperature": 0.0,
         "n": 1,
-        "response_format": {"type": "json_object"},  # вернёт валидный JSON; внутри должен быть массив
+        "response_format": {"type": "json_object"},
         "max_tokens": 1200,
     }
 
@@ -116,42 +106,53 @@ async def find_poi_ai(
     if not data:
         return []
 
-    # Достаём content и парсим как JSON; допускаем, что корень — объект с массивом внутри
+    # --- парсинг ответа ---
     try:
         content = (data["choices"][0]["message"]["content"] or "").strip()
         parsed = json.loads(content)
     except Exception:
         return []
 
-    # Нормализуем: если пришёл объект с ключом 'items' или 'results' — берём его, иначе если это массив — берём массив
+    # достаём массив из объекта (берём первый value-список, если ключ неизвестен)
+    candidates: Any
     if isinstance(parsed, dict):
-        candidates = parsed.get("items") or parsed.get("results") or parsed.get("data") or parsed.get("pois")
+        candidates = (
+            parsed.get("items")
+            or parsed.get("results")
+            or parsed.get("data")
+            or parsed.get("pois")
+        )
+        if not isinstance(candidates, list):
+            # найдём первый list среди значений
+            for v in parsed.values():
+                if isinstance(v, list):
+                    candidates = v
+                    break
     else:
         candidates = parsed
     items = _normalize_items(candidates)
 
-    # bbox-фильтр и дедуп
-    if bbox:
-        items = [it for it in items if _in_bbox(it["lat"], it["lon"], bbox)]
-    items = _dedup_by_coords(items)
-
-    # Догеокод адресов, если нужно (редкий кейс)
+    # --- ДОГЕОКОД: пробуем «спасти» элементы, если задан backfill (до bbox-фильтра!) ---
     if geocode_backfill:
         fixed: List[Dict[str, Any]] = []
         for it in items:
-            if not bbox or _in_bbox(it["lat"], it["lon"], bbox):
-                fixed.append(it); continue
-            addr = it.get("address") or it["name"]
-            try:
-                coords = await geocode_backfill(addr)
-            except Exception:
-                coords = None
-            if coords:
-                lat2, lon2 = coords
-                if not bbox or _in_bbox(lat2, lon2, bbox):
-                    it["lat"], it["lon"] = lat2, lon2
-                    fixed.append(it)
+            lat, lon = it["lat"], it["lon"]
+            # если bbox указан и текущие координаты вне bbox — попробуем догеокодить адрес/название
+            if bbox and not _in_bbox(lat, lon, bbox):
+                addr = it.get("address") or it["name"]
+                try:
+                    coords = await geocode_backfill(addr)
+                except Exception:
+                    coords = None
+                if coords:
+                    it["lat"], it["lon"] = coords
+            fixed.append(it)
         items = fixed
+
+    # --- теперь bbox-фильтр и дедуп ---
+    if bbox:
+        items = [it for it in items if _in_bbox(it["lat"], it["lon"], bbox)]
+    items = _dedup_by_coords(items)
 
     if limit and len(items) > limit:
         items = items[:limit]
