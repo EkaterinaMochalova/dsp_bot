@@ -9,7 +9,7 @@ import aiohttp
 
 OPENAI_URL   = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
 OPENAI_KEY   = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
 # bbox России (грубо): (min_lon, min_lat, max_lon, max_lat)
 RUSSIA_BBOX: Tuple[float, float, float, float] = (19.0, 41.0, 190.0, 82.0)
