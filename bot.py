@@ -1236,28 +1236,28 @@ async def cmd_geo(m: types.Message):
         return any(x in ql for x in ["аптека","стадион","тц","торгов","школ","парк","вокзал","аэропорт","жк","новострой"])
 
     async def _send(pois_list):
-        nonlocal LAST_POI
-        LAST_POI = pois_list
-        shown = pois_list[:15]
-        lines = []
-        for i, p in enumerate(shown, 1):
-            addr = p.get("address") or ""
-            pr = p.get("provider", "")
-            lines.append(f"{i}. {p['name']}" + (f", {addr}" if addr else "") + f"\n   [{p['lat']:.6f}, {p['lon']:.6f}] ({pr})")
-        await m.answer(
-            f"📍 Найденные точки: всего {len(pois_list)}\n"
-            f"(показано {len(shown)}; полный список — в CSV)\n\n" + ("\n".join(lines) if lines else "—")
+    global LAST_POI  # ← вместо nonlocal
+    LAST_POI = pois_list
+    shown = pois_list[:15]
+    lines = []
+    for i, p in enumerate(shown, 1):
+        addr = p.get("address") or ""
+        pr = p.get("provider", "")
+        lines.append(f"{i}. {p['name']}" + (f", {addr}" if addr else "") + f"\n   [{p['lat']:.6f}, {p['lon']:.6f}] ({pr})")
+    await m.answer(
+        f"📍 Найденные точки: всего {len(pois_list)}\n"
+        f"(показано {len(shown)}; полный список — в CSV)\n\n" + ("\n".join(lines) if lines else "—")
+    )
+    try:
+        df = pd.DataFrame(pois_list)
+        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+        await m.answer_document(
+            BufferedInputFile(csv_bytes, filename="geo_points.csv"),
+            caption=f"Точки «{query}» ({len(pois_list)} шт.)"
         )
-        try:
-            df = pd.DataFrame(pois_list)
-            csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-            await m.answer_document(
-                BufferedInputFile(csv_bytes, filename="geo_points.csv"),
-                caption=f"Точки «{query}» ({len(pois_list)} шт.)"
-            )
-        except Exception:
-            pass
-        await m.answer("Теперь можно: /near_geo 2 — подобрать экраны рядом.")
+    except Exception:
+        pass
+    await m.answer("Теперь можно: /near_geo 2 — подобрать экраны рядом.")
 
     try:
         if provider == "nominatim":
