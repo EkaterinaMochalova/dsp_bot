@@ -6,6 +6,8 @@ from typing import Any
 
 import pandas as pd
 import aiohttp
+from aiogram import Router
+router = Router(name="main")   # 👈 ЭТО ДОЛЖНО БЫТЬ ДО ДЕКОРОТОРОВ
 
 try:
     import certifi  # опционально
