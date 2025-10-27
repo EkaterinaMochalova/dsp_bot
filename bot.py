@@ -26,10 +26,10 @@ from aiogram import Bot, Dispatcher
 from kb_router import kb_router
 from kb import load_kb_intents
 
-dp.include_router(kb_router)
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+dp.include_router(kb_router)
 
 async def main():
     # 👇 загружаем intents перед стартом
