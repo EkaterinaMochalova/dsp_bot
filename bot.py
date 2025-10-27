@@ -1,10 +1,8 @@
 # ====== imports ======
-import os, io, math, asyncio, logging, time, json, ssl, re
+import os, io, math, asyncio, logging, time, json, ssl, re, random
 from pathlib import Path
 from datetime import datetime
-import random
 from typing import Any
-from geo_ai import find_poi_ai
 
 import pandas as pd
 import aiohttp
@@ -15,37 +13,39 @@ except Exception:
     certifi = None
 
 # aiogram 3.x
-from aiogram import Bot, Dispatcher, F, types, Router
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import Message, BufferedInputFile, BotCommand
 from aiogram.filters import Command
-from geo_ai import find_poi_ai, RUSSIA_BBOX           # OpenAI-поиск POI
-from overpass_provider import search_overpass         # Overpass (OSM) провайдер
 
-
-from aiogram import Bot, Dispatcher
-from kb_router import kb_router
-from kb import load_kb_intents
-
-
-dp = Dispatcher()
-
-async def main():
-    # 👇 загружаем intents перед стартом
-    await load_kb_intents()
-
-    # 👇 подключаем роутеры в правильном порядке
-    dp.include_router(kb_router)   # до nlu_router
-
-    # 👇 запускаем бота
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
-
+# гео-провайдеры (убери дубли)
+from geo_ai import find_poi_ai, RUSSIA_BBOX          # OpenAI-поиск POI
+from overpass_provider import search_overpass        # Overpass (OSM)
 
 # ====== logging ======
 logging.basicConfig(level=logging.INFO)
+
+# ====== BOT (aiogram 3.x) ======
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise SystemExit("Set BOT_TOKEN env var first")
+
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+
+# ====== KB (инструкции) ======
+from kb_router import kb_router
+from kb import load_kb_intents
+
+# ====== попытка импортировать доп. роутеры (если есть) ======
+try:
+    from geo_router import geo_router    # если у тебя отдельный geo_router.py
+except Exception:
+    geo_router = None
+
+try:
+    from router import router            # твой «основной» router, если вынесен
+except Exception:
+    router = None
 
 # ====== ENV CONFIG ======
 OBDSP_BASE = os.getenv("OBDSP_BASE", "https://obdsp.projects.eraga.net").strip()
@@ -67,7 +67,6 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Кэш-каталог (можно переопределить env-переменной)
 CACHE_DIR = Path(os.getenv("SCREENS_CACHE_DIR", "/tmp/omnika_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -87,12 +86,9 @@ PLAN_MAX_PLAYS_PER_HOUR = 40  # лимит показов в час для пл�
 
 # ===== Places / Geocoding config =====
 GEOCODER_PROVIDER = (os.getenv("GEOCODER_PROVIDER") or "nominatim").lower()
-GOOGLE_PLACES_KEY = os.getenv("GOOGLE_PLACES_KEY") or ""   # если захочешь Google
-YANDEX_API_KEY    = os.getenv("YANDEX_API_KEY") or ""      # если захочешь Яндекс
-D2GIS_API_KEY     = os.getenv("D2GIS_API_KEY") or ""       # если захочешь 2ГИС
-
-# --- Geo providers ---
-import aiohttp, asyncio, json
+GOOGLE_PLACES_KEY = os.getenv("GOOGLE_PLACES_KEY") or ""
+YANDEX_API_KEY    = os.getenv("YANDEX_API_KEY") or ""
+D2GIS_API_KEY     = os.getenv("D2GIS_API_KEY") or ""
 
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
@@ -103,6 +99,51 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 # последнее найденное множество POI (для /near_geo без текста)
 LAST_POI: list[dict] = []
+
+# ====== main ======
+async def main():
+    # Загружаем intents для KB
+    await load_kb_intents()
+
+    # Регистрируем роутеры ровно один раз
+    dp.include_router(kb_router)        # сначала — KB (ответы-ссылки на инструкции)
+    if geo_router:
+        dp.include_router(geo_router)   # затем гео, если есть
+    if router:
+        dp.include_router(router)       # затем твой основной router
+
+    # Если NLU-роутер объявлен внутри этого файла ниже — подключи его ТОЛЬКО здесь:
+    try:
+        from __main__ import nlu_router  # он появится после определения секции NLU
+        dp.include_router(nlu_router)
+    except Exception:
+        pass
+
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Проверка, что бот жив"),
+        BotCommand(command="ping", description="Проверка ответа"),
+        BotCommand(command="cache_info", description="Диагностика кэша"),
+        BotCommand(command="status", description="Статус бота и кэша"),
+        BotCommand(command="sync_api", description="Синхронизация инвентаря из API"),
+        BotCommand(command="shots", description="Фотоотчёты кампании"),
+        BotCommand(command="forecast", description="Прогноз по последней выборке"),
+        BotCommand(command="near", description="Экраны возле точки"),
+        BotCommand(command="pick_city", description="Равномерная выборка по городу"),
+        BotCommand(command="pick_at", description="Равномерная выборка в круге"),
+        BotCommand(command="export_last", description="Экспорт последней выборки"),
+        BotCommand(command="help", description="Справка"),
+        BotCommand(command="plan", description="План: бюджет → экраны → слоты"),
+    ])
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    me = await bot.get_me()
+    logging.info(f"✅ Бот @{me.username} запущен и ждёт сообщения…")
+
+    # ВНИМАНИЕ: сюда передаём экземпляр bot, а не класс Bot
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 # ====== Меню и help ======
 HELP = (
@@ -1069,13 +1110,7 @@ def _distribute_slots_evenly(n_items: int, total_slots: int) -> list[int]:
         res[i] += 1
     return res
 
-# ====== BOT (aiogram 3.x) ======
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise SystemExit("Set BOT_TOKEN env var first")
 
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
 
 geo_router = Router(name="geo")
 router = Router()
@@ -1086,7 +1121,6 @@ nlu_router = Router(name="nlu")
 from aiogram import Router, F, types
 from aiogram.filters import Command
 
-geo_router = Router(name="geo")
 
 # Хранилище последнего списка POI (если у тебя уже есть — оставь своё)
 LAST_POI = []
@@ -1610,8 +1644,6 @@ async def cmd_near_geo(m: types.Message):
         )
     except Exception:
         pass
-
-dp.include_router(geo_router)
 
 
 # ---------- базовые команды ----------
@@ -2634,57 +2666,35 @@ async def fallback_text(m: types.Message):
             reply_markup=make_main_menu()
         )
 
-# ---------- Регистрация роутера и запуск ----------
-dp.include_router(router)
-
 # ---------- NLU-подсказки по свободному тексту (safe, без конфликтов с командами) ----------
 import re
 from aiogram import Router, F, types
 from aiogram.utils.text_decorations import html_decoration as hd
 
-# берём только обычный текст (не команды, не от ботов)
-# ---------- NLU-подсказки по свободному тексту (safe, без конфликтов с командами) ----------
-import re
-from aiogram import Router, F, types
-from aiogram.utils.text_decorations import html_decoration as hd
+# 1) создаём отдельный роутер для NLU
+nlu_router = Router(name="nlu")
 
-# 2) и только потом вешаем фильтр: обычный текст, не команды, не от ботов
+# 2) фильтруем: обычный текст (не команды, не от ботов)
 nlu_router.message.filter(F.text, ~F.text.regexp(r"^/"), ~F.via_bot)
 
 # ===== helpers =====
 def _parse_money(s: str) -> float | None:
-    """
-    Ищет сумму денег. Приоритет после слова 'бюджет', иначе — первое число.
-    Поддержка суффиксов: к/K (тыс), м/M (млн), применяется ТОЛЬКО если стоит сразу после числа.
-    """
     if not s:
         return None
     t = s.lower()
-
-    m = re.search(
-        r"(?:\bбюджет|\bbudget)\s*[:=]?\s*"
-        r"(\d{1,3}(?:[ \u00A0]?\d{3})+|\d+(?:[.,]\d+)?)\s*([кkмm])?\b",
-        t, flags=re.IGNORECASE
-    )
+    m = re.search(r"(?:\bбюджет|\bbudget)\s*[:=]?\s*(\d{1,3}(?:[ \u00A0]?\d{3})+|\d+(?:[.,]\d+)?)\s*([кkмm])?\b", t, re.I)
     if not m:
-        m = re.search(
-            r"\b(\d{1,3}(?:[ \u00A0]?\d{3})+|\d+(?:[.,]\d+)?)\s*([кkмm])?\b",
-            t, flags=re.IGNORECASE
-        )
+        m = re.search(r"\b(\d{1,3}(?:[ \u00A0]?\d{3})+|\d+(?:[.,]\d+)?)\s*([кkмm])?\b", t, re.I)
     if not m:
         return None
-
     num, suf = m.group(1), (m.group(2) or "").lower()
     num = num.replace(" ", "").replace("\u00A0", "").replace(",", ".")
     try:
         val = float(num)
     except ValueError:
         return None
-
-    if suf in {"м", "m"}:
-        val *= 1_000_000
-    elif suf in {"к", "k"}:
-        val *= 1_000
+    if suf in ("м", "m"): val *= 1_000_000
+    elif suf in ("к", "k"): val *= 1_000
     return val
 
 def _parse_int(s: str) -> int | None:
@@ -2692,7 +2702,6 @@ def _parse_int(s: str) -> int | None:
     return int(m.group(1)) if m else None
 
 def _normalize_city_token(raw: str) -> str:
-    """Переводим 'в москве', 'спб', 'питере' и т.п. к нормальному виду для команды."""
     t = (raw or "").strip(" .,!?:;\"'()").lower()
     t = re.sub(r"^(?:город|г\.)\s+", "", t)
     specials = {
@@ -2720,13 +2729,11 @@ def _normalize_city_token(raw: str) -> str:
     return t.capitalize() if t else ""
 
 def _extract_city(text: str) -> str | None:
-    """Достаём город и возвращаем БЕЗ предлога, нормализованный."""
     m = re.search(r"(?:^|\s)(?:в|по|из)\s+([А-ЯA-ZЁ][\w\- ]{1,40})", text or "", flags=re.IGNORECASE)
     if m:
         cand = re.split(r"[,.!?:;0-9]", m.group(1).strip())[0]
         norm = _normalize_city_token(cand)
-        if norm:
-            return norm
+        if norm: return norm
     low = (text or "").lower()
     for key in ("москва", "мск", "спб", "санкт-петербург", "санкт петербург", "питер"):
         if key in low:
@@ -2747,45 +2754,25 @@ def _has_any(text: str, words: list[str]) -> bool:
     return any(w in t for w in words)
 
 def _extract_formats(text: str) -> list[str]:
-    """
-    Возвращаем токены форматов в ВЕРХНЕМ регистре (как ждут фильтры).
-    """
     t = (text or "").lower()
     fmts = []
-
-    if any(w in t for w in ("billboard", "билбор", "биллбор", "билборд", "билборды", "bb", "dbb", "бб")):
-        fmts.append("BILLBOARD")
-    if any(w in t for w in ("supersite", "суперсайт", "суперсайты", "ss", "dss")):
-        fmts.append("SUPERSITE")
-    if any(w in t for w in ("cb", "ситиборд", "ситиборды", "cityboard", "city board", "dcb", "сити борд", "сити-борд")):
-        fmts.append("CITY_BOARD")
-    if any(w in t for w in ("cf", "ситиформат", "сити форматы", "dcf", "сити-формат")):
-        fmts.append("CITY_FORMAT")
-    if any(w in t for w in ("мцк", "экраны на мцк")):
-        fmts.append("CITY_FORMAT_RC")
-    if any(w in t for w in ("метро", "экраны в метро")):
-        fmts.append("CITY_FORMAT_WD")
-    if any(w in t for w in ("вокзал", "вокзалах", "экраны на вокзал")):
-        fmts.append("CITY_FORMAT_RD")
-    if any(w in t for w in ("медиафасад", "медиафасады", "фасад", "фасады", "mediafacade", "media facade")):
-        fmts.append("MEDIAFACADE")
-    if any(w in t for w in ("индор", "indoor", "в тц", "торговый центр", "торговые центры", "экраны в помещениях")):
-        fmts.append("OTHER")
-    if any(w in t for w in ("аэропорт", "аэропорты", "airport", "airports", "экраны в аэропорту")):
-        fmts.append("SKY_DIGITAL")
-    if any(w in t for w in ("пвз", "pickup point", "пункт выдачи", "wildberries", "вб")):
-        fmts.append("PVZ_SCREEN")
-
-    seen, out = set(), []
+    if any(w in t for w in ("billboard", "билбор", "биллбор", "билборд", "билборды", "bb", "dbb", "бб")): fmts.append("BILLBOARD")
+    if any(w in t for w in ("supersite", "суперсайт", "суперсайты", "ss", "dss")): fmts.append("SUPERSITE")
+    if any(w in t for w in ("cb", "ситиборд", "cityboard", "city board", "dcb", "сити борд", "сити-борд")): fmts.append("CITY_BOARD")
+    if any(w in t for w in ("cf", "ситиформат", "сити форматы", "dcf", "сити-формат")): fmts.append("CITY_FORMAT")
+    if "мцк" in t: fmts.append("CITY_FORMAT_RC")
+    if "метро" in t: fmts.append("CITY_FORMAT_WD")
+    if any(w in t for w in ("вокзал", "вокзалах")): fmts.append("CITY_FORMAT_RD")
+    if any(w in t for w in ("медиафасад", "фасад", "mediafacade", "media facade")): fmts.append("MEDIAFACADE")
+    if any(w in t for w in ("индор", "indoor", "в тц", "торговый центр", "торговые центры")): fmts.append("OTHER")
+    if any(w in t for w in ("аэропорт", "аэропорты", "airport", "airports")): fmts.append("SKY_DIGITAL")
+    if any(w in t for w in ("пвз", "pickup point", "пункт выдачи", "wildberries", "вб")): fmts.append("PVZ_SCREEN")
+    out, seen = [], set()
     for f in fmts:
-        if f not in seen:
-            out.append(f); seen.add(f)
+        if f not in seen: out.append(f); seen.add(f)
     return out
 
 def _extract_owners(text: str) -> list[str]:
-    """
-    Ловим owner=..., 'владелец ...', 'оператор ...'. Возвращаем список токенов без цифр.
-    """
     t = (text or "")
     m = re.search(r"(?:owner|владелец|владельц[ау]|оператор)\s*[:=]?\s*([A-Za-zА-Яа-я0-9_\-\s,;|]+)", t, flags=re.IGNORECASE)
     if not m:
@@ -2799,12 +2786,11 @@ def _extract_owners(text: str) -> list[str]:
         cleaned.append(v)
     return cleaned
 
-# ===== ядро: маппинг текста → команда =====
+# ===== ядро: текст → команда =====
 def suggest_command_from_text(text: str) -> tuple[str | None, str]:
     t = (text or "").strip()
     low = t.lower()
 
-    # /plan — планирование кампании под бюджет
     if _has_any(low, ["план", "спланируй", "на бюджет", "под бюджет", "кампан", "распред", "показы"]):
         budget = _parse_money(low) or 200_000
         n = _parse_int(low) or 10
@@ -2820,7 +2806,6 @@ def suggest_command_from_text(text: str) -> tuple[str | None, str]:
         cmd = f"/plan budget={int(budget)} city={city} n={n} days={days}{fmt_part}{own_part}{top}"
         return cmd, "Планирование кампании под бюджет"
 
-    # /pick_city — равномерная выборка по городу
     if _has_any(low, ["подбери", "выбери", "нужно", "хочу"]) and _has_any(low, ["в ", "по ", "из "]):
         city_raw = _extract_city(t)
         if city_raw:
@@ -2832,7 +2817,6 @@ def suggest_command_from_text(text: str) -> tuple[str | None, str]:
             own_part = f" owner={','.join(owners)}" if owners else ""
             return f"/pick_city {city} {n}{fmt_part}{own_part}", "Равномерная выборка по городу"
 
-    # /near — экраны в радиусе / вокруг точки
     latlon = _extract_latlon(t)
     if latlon or _has_any(low, ["рядом", "около", "в радиусе", "вокруг", "near", "поблизости"]):
         if latlon:
@@ -2840,7 +2824,6 @@ def suggest_command_from_text(text: str) -> tuple[str | None, str]:
         else:
             return "📍 Пришлите геолокацию или используйте: /near <lat> <lon> 2", "Экраны вокруг вашей точки"
 
-    # /forecast — оценка показов по последней выборке
     if _has_any(low, ["сколько показ", "прогноз", "forecast", "хватит ли", "оценка показов"]):
         budget = _parse_money(low)
         if budget:
@@ -2848,7 +2831,6 @@ def suggest_command_from_text(text: str) -> tuple[str | None, str]:
         else:
             return "/forecast days=7 hours_per_day=8", "Оценка по последней выборке"
 
-    # /sync_api — подтянуть инвентарь
     if _has_any(low, ["обнови список", "подтяни из апи", "синхронизируй", "обнови экраны", "sync api"]):
         fmts = _extract_formats(low)
         city_raw = _extract_city(t)
@@ -2859,7 +2841,6 @@ def suggest_command_from_text(text: str) -> tuple[str | None, str]:
         base = "/sync_api " + " ".join(parts) if parts else "/sync_api size=500 pages=3"
         return base.strip(), "Синхронизация инвентаря из API"
 
-    # /shots — фотоотчёт
     if _has_any(low, ["фотоотчет", "фото отчёт", "кадры кампании", "impression", "shots"]):
         camp = _parse_int(low) or 0
         if camp > 0:
@@ -2867,16 +2848,13 @@ def suggest_command_from_text(text: str) -> tuple[str | None, str]:
         else:
             return "/shots campaign=<ID> per=0 limit=100", "Фотоотчёт: укажите campaign ID"
 
-    # /export_last — экспорт
     if _has_any(low, ["выгрузи", "экспорт", "csv", "xlsx", "таблица"]):
         return "/export_last", "Экспорт последней выборки"
 
-    # /radius — изменить радиус по умолчанию
     if _has_any(low, ["радиус", "поставь радиус", "изменить радиус"]):
         r = _parse_int(low) or 2
         return f"/radius {r}", "Задать радиус по умолчанию (км)"
 
-    # /status /help
     if _has_any(low, ["статус", "что загружено", "сколько экранов"]):
         return "/status", "Статус загруженных данных"
     if _has_any(low, ["help", "помощ", "что умеешь", "команды"]):
@@ -2910,36 +2888,3 @@ async def natural_language_assistant(m: types.Message):
         body = hd.quote(hint) + "\n\n" + hd.quote(tail)
 
     await m.answer(body, parse_mode="HTML", disable_web_page_preview=True)
-
-# Подключение NLU-роутера ДОЛЖНО быть выше, чем основной:
-dp.include_router(nlu_router)
-
-async def main():
-    try:
-        load_screens_cache()
-    except Exception as e:
-        logging.warning(f"Не удалось загрузить кэш на старте: {e}")
-
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Проверка, что бот жив"),
-        BotCommand(command="ping", description="Проверка ответа"),
-        BotCommand(command="cache_info", description="Диагностика кэша"),
-        BotCommand(command="status", description="Статус бота и кэша"),
-        BotCommand(command="sync_api", description="Синхронизация инвентаря из API"),
-        BotCommand(command="shots", description="Фотоотчёты кампании"),
-        BotCommand(command="forecast", description="Прогноз по последней выборке"),
-        BotCommand(command="near", description="Экраны возле точки"),
-        BotCommand(command="pick_city", description="Равномерная выборка по городу"),
-        BotCommand(command="pick_at", description="Равномерная выборка в круге"),
-        BotCommand(command="export_last", description="Экспорт последней выборки"),
-        BotCommand(command="help", description="Справка"),
-        BotCommand(command="plan", description="План показа: бюджет → экраны → слоты"),
-    ])
-
-    await bot.delete_webhook(drop_pending_updates=True)
-    me = await bot.get_me()
-    logging.info(f"✅ Бот @{me.username} запущен и ждёт сообщений…")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
