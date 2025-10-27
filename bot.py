@@ -106,11 +106,11 @@ async def main():
     await load_kb_intents()
 
     # Регистрируем роутеры ровно один раз
-    dp.include_router(kb_router)        # сначала — KB (ответы-ссылки на инструкции)
-    if geo_router:
-        dp.include_router(geo_router)   # затем гео, если есть
-    if router:
-        dp.include_router(router)       # затем твой основной router
+
+    dp.include_router(router)        # основной: /help, /status, /plan и т.д.
+    dp.include_router(geo_router)    # гео-команды (/geo, /near_geo, пр.). 
+    dp.include_router(kb_router)     # ссылки на инструкцию (не трогает /команды)
+    
 
     # Если NLU-роутер объявлен внутри этого файла ниже — подключи его ТОЛЬКО здесь:
     try:
