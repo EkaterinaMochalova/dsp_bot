@@ -21,13 +21,29 @@ from aiogram.filters import Command
 from geo_ai import find_poi_ai, RUSSIA_BBOX           # OpenAI-поиск POI
 from overpass_provider import search_overpass         # Overpass (OSM) провайдер
 
+
+from aiogram import Bot, Dispatcher
 from kb_router import kb_router
 from kb import load_kb_intents
+from nlu import nlu_router
 
-dp.include_router(kb_router)   # ДО nlu_router
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
 
-# перед start_polling:
-await load_kb_intents()
+async def main():
+    # 👇 загружаем intents перед стартом
+    await load_kb_intents()
+
+    # 👇 подключаем роутеры в правильном порядке
+    dp.include_router(kb_router)   # до nlu_router
+
+    # 👇 запускаем бота
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
+
 
 # ====== logging ======
 logging.basicConfig(level=logging.INFO)
