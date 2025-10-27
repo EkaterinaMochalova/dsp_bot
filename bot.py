@@ -21,6 +21,14 @@ from aiogram.filters import Command
 from geo_ai import find_poi_ai, RUSSIA_BBOX           # OpenAI-поиск POI
 from overpass_provider import search_overpass         # Overpass (OSM) провайдер
 
+from kb_router import kb_router
+from kb import load_kb_intents
+
+dp.include_router(kb_router)   # ДО nlu_router
+
+# перед start_polling:
+await load_kb_intents()
+
 # ====== logging ======
 logging.basicConfig(level=logging.INFO)
 
@@ -91,7 +99,8 @@ HELP = (
     "   — «Подбери 10 экранов в Москве»\n"
     "   — «Спланируй кампанию на 30 билбордах в Москве, 7 дней, бюджет 250000»\n"
     "   — «Хочу посмотреть 20 фасадов в Санкт-Петербурге\n"
-    "   Я постараюсь подсказать подходящую команду.\n\n"
+    "   Я постараюсь подсказать подходящую команду.\n"
+    "   Или задай вопрос - например, “как загрузить крео?” — пришлю ссылку на соответствующую инструкцию.\n\n"
 
     "⚙️ Основные команды:\n"
     "• /status — что загружено и сколько экранов\n"
