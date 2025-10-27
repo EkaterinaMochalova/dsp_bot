@@ -27,7 +27,6 @@ from kb_router import kb_router
 from kb import load_kb_intents
 
 
-bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 dp.include_router(kb_router)
 
