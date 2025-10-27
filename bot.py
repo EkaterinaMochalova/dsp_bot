@@ -28,7 +28,6 @@ from kb import load_kb_intents
 
 
 dp = Dispatcher()
-dp.include_router(kb_router)
 
 async def main():
     # 👇 загружаем intents перед стартом
