@@ -6,22 +6,23 @@ from typing import Any
 
 import pandas as pd
 import aiohttp
-from aiogram import Router
-router = Router(name="main")   # 👈 ЭТО ДОЛЖНО БЫТЬ ДО ДЕКОРОТОРОВ
-
-try:
-    import certifi  # опционально
-except Exception:
-    certifi = None
 
 # aiogram 3.x
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F, types, Router
 from aiogram.types import Message, BufferedInputFile, BotCommand
 from aiogram.filters import Command
 
-# гео-провайдеры (убери дубли)
-from geo_ai import find_poi_ai, RUSSIA_BBOX          # OpenAI-поиск POI
-from overpass_provider import search_overpass        # Overpass (OSM)
+# создаём ГЛАВНЫЙ роутер ИМЕННО ЗДЕСЬ и НЕ затираем его далее
+router = Router(name="main")   # 👈 этот экземпляр используют твои @router.message(...)
+
+try:
+    import certifi
+except Exception:
+    certifi = None
+
+# гео-провайдеры
+from geo_ai import find_poi_ai, RUSSIA_BBOX
+from overpass_provider import search_overpass
 
 # ====== logging ======
 logging.basicConfig(level=logging.INFO)
@@ -38,16 +39,17 @@ dp = Dispatcher()
 from kb_router import kb_router
 from kb import load_kb_intents
 
-# ====== попытка импортировать доп. роутеры (если есть) ======
+# ====== опциональные внешние роутеры (если есть) ======
+# ⚠️ НЕ затираем наш router. Импортируем под ДРУГИМ именем.
 try:
-    from geo_router import geo_router    # если у тебя отдельный geo_router.py
+    from geo_router import geo_router        # если есть отдельный модуль
 except Exception:
     geo_router = None
 
 try:
-    from router import router            # твой «основной» router, если вынесен
+    from router import router as extra_router  # если есть внешний «основной» роутер
 except Exception:
-    router = None
+    extra_router = None
 
 # ====== ENV CONFIG ======
 OBDSP_BASE = os.getenv("OBDSP_BASE", "https://obdsp.projects.eraga.net").strip()
@@ -104,20 +106,27 @@ LAST_POI: list[dict] = []
 
 # ====== main ======
 async def main():
-    # Загружаем intents для KB
+    # загрузим intents для KB
     await load_kb_intents()
 
-    # Регистрируем роутеры ровно один раз
+    # Подключаем роутеры, НО только экземпляры Router
+    # 1) твой локальный основной (с декораторами @router.message)
+    dp.include_router(router)
 
-    dp.include_router(router)        # основной: /help, /status, /plan и т.д.
-    dp.include_router(geo_router)    # гео-команды (/geo, /near_geo, пр.). 
-    dp.include_router(kb_router)     # ссылки на инструкцию (не трогает /команды)
-    
+    # 2) внешние, если существуют и это экземпляры Router
+    if geo_router and isinstance(geo_router, Router):
+        dp.include_router(geo_router)
+    if extra_router and isinstance(extra_router, Router):
+        dp.include_router(extra_router)
 
-    # Если NLU-роутер объявлен внутри этого файла ниже — подключи его ТОЛЬКО здесь:
+    # 3) KB — раньше NLU, чтобы перехватывать «как загрузить крео»
+    dp.include_router(kb_router)
+
+    # 4) NLU-роутер, если он объявлен ниже в этом файле
     try:
-        from __main__ import nlu_router  # он появится после определения секции NLU
-        dp.include_router(nlu_router)
+        from __main__ import nlu_router
+        if isinstance(nlu_router, Router):
+            dp.include_router(nlu_router)
     except Exception:
         pass
 
@@ -139,10 +148,9 @@ async def main():
 
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
-    logging.info(f"✅ Бот @{me.username} запущен и ждёт сообщения…")
+    logging.info(f"✅ Бот @{me.username} запущен и ждёт сообщений…")
 
-    # ВНИМАНИЕ: сюда передаём экземпляр bot, а не класс Bot
-    await dp.start_polling(bot)
+    await dp.start_polling(bot)   # <-- именно экземпляр bot
 
 if __name__ == "__main__":
     asyncio.run(main())
