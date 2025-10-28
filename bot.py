@@ -2855,19 +2855,17 @@ async def main():
     # загрузим intents для KB
     await load_kb_intents()
 
-
-
-    # 2) внешние, если существуют и это экземпляры Router
+    # 1) внешние, если существуют и это экземпляры Router
     if geo_router and isinstance(geo_router, Router):
         dp.include_router(geo_router)
     if extra_router and isinstance(extra_router, Router):
         dp.include_router(extra_router)
 
-    # 3) KB — раньше NLU, чтобы перехватывать «как загрузить крео»
+    # 2) KB — раньше NLU, чтобы перехватывать «как загрузить крео»
     dp.include_router(kb_router)
 
     # Подключаем роутеры, НО только экземпляры Router
-    # 1) твой локальный основной (с декораторами @router.message)
+    # 3) твой локальный основной (с декораторами @router.message)
     dp.include_router(router)
 
     # 4) NLU-роутер, если он объявлен ниже в этом файле
