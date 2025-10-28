@@ -2852,56 +2852,34 @@ async def natural_language_assistant(m: types.Message):
 
 # ====== main ======
 async def main():
-    # загрузим intents для KB
+    # Подгруzim intents KB (без этого kb_router может вернуть пусто)
     await load_kb_intents()
 
-    # 1) внешние, если существуют и это экземпляры Router
-    if geo_router and isinstance(geo_router, Router):
-        dp.include_router(geo_router)
-    if extra_router and isinstance(extra_router, Router):
-        dp.include_router(extra_router)
+    # Порядок подключения важен:
+    dp.include_router(kb_router)      # 1) KB: "как загрузить крео" и т.п.
+    dp.include_router(nlu_router)    # 2) NLU-подсказки по свободному тексту
+    dp.include_router(geo_router)    # 3) специализированные роутеры (если есть)
+    dp.include_router(router)            # 5) общий router с fallback'ом — строго последним
 
-    # 2) KB — раньше NLU, чтобы перехватывать «как загрузить крео»
-    dp.include_router(kb_router)
-
-    # 3) NLU-роутер, если он объявлен ниже в этом файле
-    try:
-        from __main__ import nlu_router
-        if isinstance(nlu_router, Router):
-            dp.include_router(nlu_router)
-    except Exception:
-        pass
-    # Подключаем роутеры, НО только экземпляры Router
-    # 3) твой локальный основной (с декораторами @router.message)
-    dp.include_router(router)
-
-    
-
+    # Команды в меню
     await bot.set_my_commands([
         BotCommand(command="start", description="Проверка, что бот жив"),
-        BotCommand(command="ping", description="Проверка ответа"),
-        BotCommand(command="cache_info", description="Диагностика кэша"),
+        BotCommand(command="help", description="Справка"),
         BotCommand(command="status", description="Статус бота и кэша"),
+        BotCommand(command="cache_info", description="Диагностика кэша"),
         BotCommand(command="sync_api", description="Синхронизация инвентаря из API"),
-        BotCommand(command="shots", description="Фотоотчёты кампании"),
-        BotCommand(command="forecast", description="Прогноз по последней выборке"),
         BotCommand(command="near", description="Экраны возле точки"),
         BotCommand(command="pick_city", description="Равномерная выборка по городу"),
         BotCommand(command="pick_at", description="Равномерная выборка в круге"),
-        BotCommand(command="export_last", description="Экспорт последней выборки"),
-        BotCommand(command="help", description="Справка"),
+        BotCommand(command="forecast", description="Прогноз по последней выборке"),
         BotCommand(command="plan", description="План: бюджет → экраны → слоты"),
+        BotCommand(command="export_last", description="Экспорт последней выборки"),
+        BotCommand(command="shots", description="Фотоотчёты кампании"),
     ])
 
+    # Чистим вебхук (на всякий) и запускаем поллинг
     await bot.delete_webhook(drop_pending_updates=True)
-    me = await bot.get_me()
-    logging.info(f"✅ Бот @{me.username} запущен и ждёт сообщений…")
-
-    await dp.start_polling(bot)   # <-- именно экземпляр bot
-    dp.include_router(nlu_router)
-
-    # 4) основной
-    dp.include_router(router)
+    await dp.start_polling(bot)  # ← ЭТО главное: запускает обработку апдейтов
 
 if __name__ == "__main__":
     asyncio.run(main())
