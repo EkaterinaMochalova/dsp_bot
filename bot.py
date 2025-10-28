@@ -2614,7 +2614,7 @@ async def on_file(m: types.Message):
         await m.answer(f"Не удалось обработать файл: {e}")
 
 # ---------- Fallback ----------
-@router.message(F.text)
+@router.message(F.text, ~F.text.regexp(r"^/"))
 async def fallback_text(m: types.Message):
     t = (m.text or "").strip()
     if t.startswith("/"):
