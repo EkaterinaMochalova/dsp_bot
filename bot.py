@@ -104,56 +104,6 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 # последнее найденное множество POI (для /near_geo без текста)
 LAST_POI: list[dict] = []
 
-# ====== main ======
-async def main():
-    # загрузим intents для KB
-    await load_kb_intents()
-
-    # Подключаем роутеры, НО только экземпляры Router
-    # 1) твой локальный основной (с декораторами @router.message)
-    dp.include_router(router)
-
-    # 2) внешние, если существуют и это экземпляры Router
-    if geo_router and isinstance(geo_router, Router):
-        dp.include_router(geo_router)
-    if extra_router and isinstance(extra_router, Router):
-        dp.include_router(extra_router)
-
-    # 3) KB — раньше NLU, чтобы перехватывать «как загрузить крео»
-    dp.include_router(kb_router)
-
-    # 4) NLU-роутер, если он объявлен ниже в этом файле
-    try:
-        from __main__ import nlu_router
-        if isinstance(nlu_router, Router):
-            dp.include_router(nlu_router)
-    except Exception:
-        pass
-
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Проверка, что бот жив"),
-        BotCommand(command="ping", description="Проверка ответа"),
-        BotCommand(command="cache_info", description="Диагностика кэша"),
-        BotCommand(command="status", description="Статус бота и кэша"),
-        BotCommand(command="sync_api", description="Синхронизация инвентаря из API"),
-        BotCommand(command="shots", description="Фотоотчёты кампании"),
-        BotCommand(command="forecast", description="Прогноз по последней выборке"),
-        BotCommand(command="near", description="Экраны возле точки"),
-        BotCommand(command="pick_city", description="Равномерная выборка по городу"),
-        BotCommand(command="pick_at", description="Равномерная выборка в круге"),
-        BotCommand(command="export_last", description="Экспорт последней выборки"),
-        BotCommand(command="help", description="Справка"),
-        BotCommand(command="plan", description="План: бюджет → экраны → слоты"),
-    ])
-
-    await bot.delete_webhook(drop_pending_updates=True)
-    me = await bot.get_me()
-    logging.info(f"✅ Бот @{me.username} запущен и ждёт сообщений…")
-
-    await dp.start_polling(bot)   # <-- именно экземпляр bot
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 # ====== Меню и help ======
 HELP = (
@@ -2898,3 +2848,55 @@ async def natural_language_assistant(m: types.Message):
         body = hd.quote(hint) + "\n\n" + hd.quote(tail)
 
     await m.answer(body, parse_mode="HTML", disable_web_page_preview=True)
+
+
+# ====== main ======
+async def main():
+    # загрузим intents для KB
+    await load_kb_intents()
+
+    # Подключаем роутеры, НО только экземпляры Router
+    # 1) твой локальный основной (с декораторами @router.message)
+    dp.include_router(router)
+
+    # 2) внешние, если существуют и это экземпляры Router
+    if geo_router and isinstance(geo_router, Router):
+        dp.include_router(geo_router)
+    if extra_router and isinstance(extra_router, Router):
+        dp.include_router(extra_router)
+
+    # 3) KB — раньше NLU, чтобы перехватывать «как загрузить крео»
+    dp.include_router(kb_router)
+
+    # 4) NLU-роутер, если он объявлен ниже в этом файле
+    try:
+        from __main__ import nlu_router
+        if isinstance(nlu_router, Router):
+            dp.include_router(nlu_router)
+    except Exception:
+        pass
+
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Проверка, что бот жив"),
+        BotCommand(command="ping", description="Проверка ответа"),
+        BotCommand(command="cache_info", description="Диагностика кэша"),
+        BotCommand(command="status", description="Статус бота и кэша"),
+        BotCommand(command="sync_api", description="Синхронизация инвентаря из API"),
+        BotCommand(command="shots", description="Фотоотчёты кампании"),
+        BotCommand(command="forecast", description="Прогноз по последней выборке"),
+        BotCommand(command="near", description="Экраны возле точки"),
+        BotCommand(command="pick_city", description="Равномерная выборка по городу"),
+        BotCommand(command="pick_at", description="Равномерная выборка в круге"),
+        BotCommand(command="export_last", description="Экспорт последней выборки"),
+        BotCommand(command="help", description="Справка"),
+        BotCommand(command="plan", description="План: бюджет → экраны → слоты"),
+    ])
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    me = await bot.get_me()
+    logging.info(f"✅ Бот @{me.username} запущен и ждёт сообщений…")
+
+    await dp.start_polling(bot)   # <-- именно экземпляр bot
+
+if __name__ == "__main__":
+    asyncio.run(main())
