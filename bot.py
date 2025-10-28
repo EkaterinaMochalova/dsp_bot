@@ -1074,8 +1074,6 @@ def _distribute_slots_evenly(n_items: int, total_slots: int) -> list[int]:
 
 geo_router = Router(name="geo")
 router = Router()
-nlu_router = Router(name="nlu")
-
 
 # ---------- GEO router ----------
 from aiogram import Router, F, types
