@@ -2864,17 +2864,18 @@ async def main():
     # 2) KB — раньше NLU, чтобы перехватывать «как загрузить крео»
     dp.include_router(kb_router)
 
-    # Подключаем роутеры, НО только экземпляры Router
-    # 3) твой локальный основной (с декораторами @router.message)
-    dp.include_router(router)
-
-    # 4) NLU-роутер, если он объявлен ниже в этом файле
+    # 3) NLU-роутер, если он объявлен ниже в этом файле
     try:
         from __main__ import nlu_router
         if isinstance(nlu_router, Router):
             dp.include_router(nlu_router)
     except Exception:
         pass
+    # Подключаем роутеры, НО только экземпляры Router
+    # 3) твой локальный основной (с декораторами @router.message)
+    dp.include_router(router)
+
+    
 
     await bot.set_my_commands([
         BotCommand(command="start", description="Проверка, что бот жив"),
@@ -2897,6 +2898,10 @@ async def main():
     logging.info(f"✅ Бот @{me.username} запущен и ждёт сообщений…")
 
     await dp.start_polling(bot)   # <-- именно экземпляр bot
+    dp.include_router(nlu_router)
+
+    # 4) основной
+    dp.include_router(router)
 
 if __name__ == "__main__":
     asyncio.run(main())
