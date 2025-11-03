@@ -136,6 +136,8 @@ HELP = (
     "📊 Прогнозы и планы:\n"
     "• /forecast [budget=...] [days=7] [hours_per_day=8] [hours=07-10,17-21]\n"
     "Например: /forecast days=14 hours_per_day=10 — прогноз по бюджету на 14 дней\n"
+     "• /plan budget=<сумма> [city=...] [format=...] [owner=...] [n=...] [days=...] [hours_per_day=...] [grp_min=...] [ots_min=...] [top=1]\n"
+    "Например: /plan budget=200000 city=Москва n=10 days=10 grp_min=1.2 ots_min=50 top=1  — выберет 10 экранов в Москве с GRP ≥ 1.2 и OTS ≥ 50, приоритизируя охватным показателям\n"
     "• /plan budget=<сумма> [city=...] [format=...] [owner=...] [n=...] [days=...] [hours_per_day=...] [top=1] — спланировать кампанию под бюджет\n"
     "Например: /plan budget=200000 city=Москва n=10 days=10 hours_per_day=8 — равномерно выбрать 10 экранов и рассчитать слоты\n\n"
 
@@ -159,6 +161,8 @@ HELP = (
     "   • format=billboard — только ББ\n"
     "   • format=billboard,supersite | billboard;supersite | billboard|supersite — несколько форматов\n"
     "   • owner=russ | owner=РИМ,Перспектива — фильтр по владельцу (подстрока, без учёта регистра)\n"
+    "   • grp_min=1.2 — минимальный GRP экрана\n"
+    "   • ots_min=50 — минимальный OTS экрана\n"
     "   • fields=screen_id | screen_id,format — какие поля выводить\n\n"
 )
 
@@ -552,11 +556,12 @@ def _format_mask(series: pd.Series, token: str) -> pd.Series:
         return col == "BILLBOARD"
     return col == t
 
-def apply_filters(df: pd.DataFrame, kwargs: dict[str,str]) -> pd.DataFrame:
+def apply_filters(df: pd.DataFrame, kwargs: dict[str, str]) -> pd.DataFrame:
     out = df
-    # FORMAT
+
+    # ---------- FORMAT ----------
     fmt_val = kwargs.get("format") or kwargs.get("formats") or kwargs.get("format_in")
-    if fmt_val:
+    if fmt_val and "format" in out.columns:
         fmt_list_raw = parse_list(fmt_val)
         fmt_list = [s.upper() for s in fmt_list_raw]
         mask = None
@@ -569,18 +574,42 @@ def apply_filters(df: pd.DataFrame, kwargs: dict[str,str]) -> pd.DataFrame:
             mask = m if mask is None else (mask | m)
         if mask is not None:
             out = out[mask]
-    # OWNER
+
+    # ---------- OWNER (подстрока, регистронезависимо) ----------
     own_val = kwargs.get("owner") or kwargs.get("owners") or kwargs.get("owner_in")
-    if own_val:
+    if own_val and "owner" in out.columns:
         owners = parse_list(own_val)
         mask = None
         col = out["owner"].astype(str).str.lower()
         for o in owners:
-            m = col.str.contains(o.strip().lower())
+            p = o.strip().lower()
+            if not p:
+                continue
+            m = col.str.contains(re.escape(p), na=False)
             mask = m if mask is None else (mask | m)
         if mask is not None:
             out = out[mask]
+
+    # ---------- GRP MIN ----------
+    if "grp_min" in kwargs and "grp" in out.columns:
+        try:
+            gmin = float(str(kwargs["grp_min"]).replace(",", "."))
+            grp_vals = pd.to_numeric(out["grp"], errors="coerce")
+            out = out[grp_vals >= gmin]
+        except Exception:
+            pass
+
+    # ---------- OTS MIN ----------
+    if "ots_min" in kwargs and "ots" in out.columns:
+        try:
+            omin = float(str(kwargs["ots_min"]).replace(",", "."))
+            ots_vals = pd.to_numeric(out["ots"], errors="coerce")
+            out = out[ots_vals >= omin]
+        except Exception:
+            pass
+
     return out
+
 
 # Разбивка длинного ответа на части
 async def send_lines(message: types.Message, lines: list[str], header: str | None = None, chunk: int = 60, parse_mode: str | None = None):
@@ -2099,16 +2128,19 @@ async def cmd_plan(m: types.Message):
 
     # ---- парсинг параметров ----
     parts = (m.text or "").strip().split()[1:]
-    kv: dict[str,str] = {}
+    kv: dict[str, str] = {}
     for p in parts:
         if "=" in p:
             k, v = p.split("=", 1)
             kv[k.strip().lower()] = v.strip()
 
-    # бюджет (обяз.)
+    # Бюджет (обязателен)
     budget_raw = kv.get("budget") or kv.get("b")
     if not budget_raw:
-        await m.answer("Нужно указать бюджет: /plan budget=200000 [city=...] [format=...] [owner=...] [n=10] [days=10] [hours_per_day=8] [top=1]")
+        await m.answer(
+            "Нужно указать бюджет: /plan budget=200000 [city=...] [format=...] [owner=...] "
+            "[n=10] [days=10] [hours_per_day=8] [top=1] [grp_min=..] [ots_min=..]"
+        )
         return
     try:
         v = budget_raw.lower().replace(" ", "")
@@ -2122,49 +2154,88 @@ async def cmd_plan(m: types.Message):
         await m.answer("Не понял бюджет. Пример: budget=200000 или budget=200k")
         return
 
-    # опциональные
+    # Опции
     city   = kv.get("city")
-    n      = int(kv["n"]) if kv.get("n","").isdigit() else 10
-    days   = int(kv["days"]) if kv.get("days","").isdigit() else 10
-    # часы: либо hours_per_day=8, либо windows hours=07-10,17-21
-    hours_per_day = int(kv["hours_per_day"]) if kv.get("hours_per_day","").isdigit() else None
+    n      = int(kv["n"]) if kv.get("n", "").isdigit() else 10
+    days   = int(kv["days"]) if kv.get("days", "").isdigit() else 10
+
+    # Часы: либо hours_per_day=8, либо окна hours=07-10,17-21
+    hours_per_day = int(kv["hours_per_day"]) if kv.get("hours_per_day", "").isdigit() else None
     if hours_per_day is None:
         win = _parse_hours_windows(kv.get("hours"))
         hours_per_day = win if (win is not None) else 8
 
+    # Фильтры форматов/владельцев
     formats = _as_list_any(kv.get("format") or kv.get("formats"))
     owners  = _as_list_any(kv.get("owner")  or kv.get("owners"))
-    want_top = str(kv.get("top","0")).lower() in {"1","true","yes","on"} or \
-               str(kv.get("coverage","0")).lower() in {"1","true","yes","on"}
+
+    # Пороги GRP/OTS (минимальные)
+    grp_min = None
+    ots_min = None
+    try:
+        if "grp_min" in kv:
+            grp_min = float(str(kv["grp_min"]).replace(",", "."))
+    except Exception:
+        pass
+    try:
+        if "ots_min" in kv:
+            ots_min = float(str(kv["ots_min"]).replace(",", "."))
+    except Exception:
+        pass
+
+    want_top = (
+        str(kv.get("top", "0")).lower() in {"1", "true", "yes", "on"}
+        or str(kv.get("coverage", "0")).lower() in {"1", "true", "yes", "on"}
+    )
 
     # ---- формируем пул ----
     pool = SCREENS.copy()
-    # city
+
+    # По городу
     if city and "city" in pool.columns:
         pool = pool[pool["city"].astype(str).str.strip().str.lower() == city.strip().lower()]
+
     if pool.empty:
         await m.answer("По заданному городу нет экранов (с учётом вводных).")
         return
-    # filters (format/owner)
+
+    # Собираем kwargs для apply_filters
+    filter_kwargs: dict[str, str] = {}
     if formats:
-        pool = _priority_mask_by_formats(pool, formats)
+        filter_kwargs["format"] = ",".join(formats)
     if owners:
-        pool = apply_filters(pool, {"owner": ",".join(owners)})
+        filter_kwargs["owner"] = ",".join(owners)
+    if grp_min is not None:
+        filter_kwargs["grp_min"] = str(grp_min)
+    if ots_min is not None:
+        filter_kwargs["ots_min"] = str(ots_min)
+
+    if filter_kwargs:
+        pool = apply_filters(pool, filter_kwargs)
+
     if pool.empty:
-        await m.answer("После применения фильтров экранов не осталось.")
+        pieces = []
+        if formats: pieces.append(f"format={','.join(formats)}")
+        if owners:  pieces.append(f"owner={','.join(owners)}")
+        if grp_min is not None: pieces.append(f"grp_min={grp_min}")
+        if ots_min is not None: pieces.append(f"ots_min={ots_min}")
+        hint = " (" + ", ".join(pieces) + ")" if pieces else ""
+        await m.answer("После применения фильтров экранов не осталось" + hint + ".")
         return
 
     # minBid обогащение
     pool = _fill_min_bid(pool)
 
-    # если формат не указан — отдаём приоритет BB→SUPERSITE→CITY→остальные
+    # Если формат не указан — предпочтём BB→SUPERSITE→CITY→остальные (с запасом)
     if not formats:
         pool = _prefer_formats(pool, n)
 
-    # ---- выбор экранов: top по OTS или равномерно ----
+    if pool.empty:
+        await m.answer("После приоритезации форматов экранов не осталось.")
+        return
+
+    # ---- выбор экранов: top по OTS (если просили) или равномерно ----
     if want_top and "ots" in pool.columns:
-        # берём топ по OTS (если несколько городов — в рамках текущего city)
-        # если OTS пусты — fallback к равномерному
         try:
             ots_vals = pd.to_numeric(pool["ots"], errors="coerce")
             if ots_vals.dropna().empty:
@@ -2180,23 +2251,32 @@ async def cmd_plan(m: types.Message):
         await m.answer("Не удалось выбрать экраны (слишком строгие ограничения?).")
         return
 
-    # ---- расчёт планов ----
+    # Если запрашивали больше, чем осталось после фильтров — ужмём n
+    if len(selected) < n:
+        n = len(selected)
+
+    # ---- расчёт плана ----
     # бюджет/день/экран
     budget_per_day_per_screen = budget_total / max(n, 1) / max(days, 1)
 
-    # флаг ставки
-    mb = pd.to_numeric(selected["min_bid_used"], errors="coerce")
-    # подставим медиану, если у кого-то NaN
-    median_mb = float(mb.dropna().median()) if not mb.dropna().empty else 0.0
+    # Ставка
+    mb = pd.to_numeric(selected.get("min_bid_used"), errors="coerce")
+    # Медиана по доступным
+    median_mb = float(mb.dropna().median()) if not mb.dropna().empty else None
+    if median_mb is None or median_mb <= 0:
+        # последняя попытка — взять среднее по пулу
+        pool_mb = pd.to_numeric(pool.get("min_bid_used"), errors="coerce")
+        median_mb = float(pool_mb.dropna().median()) if not pool_mb.dropna().empty else 1.0
     mb = mb.fillna(median_mb)
+    mb = mb.replace(0, median_mb)
 
-    # максимальные слоты в день по техническому лимиту
-    per_day_cap = hours_per_day * PLAN_MAX_PLAYS_PER_HOUR
+    # Технический лимит показов/день
+    per_day_cap = int(hours_per_day) * int(PLAN_MAX_PLAYS_PER_HOUR)
 
-    # расчёт слотов/день и итогов
+    # слоты/день и итоги
     slots_per_day = (budget_per_day_per_screen // mb).astype(int)
     slots_per_day = slots_per_day.clip(lower=0, upper=per_day_cap)
-    total_slots = slots_per_day * days
+    total_slots = slots_per_day * int(days)
     planned_cost = total_slots * mb
 
     out = selected.copy()
@@ -2206,7 +2286,14 @@ async def cmd_plan(m: types.Message):
     out["total_slots"] = total_slots
     out["planned_cost"] = planned_cost
 
-    # ---- экспорт ----
+    # ---- экспорт/итог ----
+    # Соберём подсказку с применёнными порогами
+    hints = []
+    if grp_min is not None: hints.append(f"GRP≥{grp_min}")
+    if ots_min is not None: hints.append(f"OTS≥{ots_min}")
+    if want_top:            hints.append("top by OTS")
+    hint_str = ("; " + ", ".join(hints)) if hints else ""
+
     try:
         csv_bytes = out.to_csv(index=False).encode("utf-8-sig")
         await m.bot.send_document(
@@ -2214,7 +2301,7 @@ async def cmd_plan(m: types.Message):
             BufferedInputFile(csv_bytes, filename="plan.csv"),
             caption=(
                 f"План: бюджет={budget_total:,.0f} ₽, n={n}, days={days}, "
-                f"hours/day={hours_per_day}, cap={PLAN_MAX_PLAYS_PER_HOUR}/час"
+                f"hours/day={hours_per_day}, cap={PLAN_MAX_PLAYS_PER_HOUR}/час{hint_str}"
             ).replace(",", " ")
         )
     except Exception as e:
@@ -2744,6 +2831,32 @@ def _extract_owners(text: str) -> list[str]:
         cleaned.append(v)
     return cleaned
 
+# --- helper: пороги по grp/ots ---
+def _extract_thresholds(text: str) -> dict[str, float]:
+    """
+    Ищет конструкции вида:
+      grp 120, grp>=120, grp минимум 120, grp от 120
+      ots 5000, ots>=5000, ots минимум 5000, ots от 5000
+      поддерживает пробел/знак/слово перед числом; запятые/точки в числе.
+    Возвращает dict с ключами 'grp_min', 'ots_min' если нашли.
+    """
+    t = (text or "").lower().replace(",", ".")
+    out: dict[str, float] = {}
+
+    # шаблон: ключ (grp|ots) + (>=|>|от|минимум|min)? + число
+    pat = r"\b(?P<key>grp|ots)\s*(?:>=|>|от|минимум|min)?\s*(?P<num>\d+(?:\.\d+)?)"
+    for m in re.finditer(pat, t, flags=re.IGNORECASE):
+        key = m.group("key").lower()
+        try:
+            val = float(m.group("num"))
+        except Exception:
+            continue
+        if key == "grp":
+            out["grp_min"] = val
+        elif key == "ots":
+            out["ots_min"] = val
+    return out
+
 # ===== ядро: текст → команда =====
 def suggest_command_from_text(text: str) -> tuple[str | None, str]:
     t = (text or "").strip()
@@ -2782,6 +2895,44 @@ def suggest_command_from_text(text: str) -> tuple[str | None, str]:
         else:
             return "📍 Пришлите геолокацию или используйте: /near <lat> <lon> 2", "Экраны вокруг вашей точки"
 
+    if _has_any(low, ["план", "спланируй", "на бюджет", "под бюджет", "кампан", "распред", "показы"]):
+        budget = _parse_money(low) or 200_000
+        n = _parse_int(low) or 10
+        m_days = re.search(r"(\d+)\s*дн", low)
+        days = int(m_days.group(1)) if m_days else 10
+        city_raw = _extract_city(t)
+        city = _normalize_city_token(city_raw) if city_raw else "Москва"
+        fmts = _extract_formats(low)
+        owners = _extract_owners(t)
+        thr = _extract_thresholds(t)  # <<< NEW
+        top = " top=1" if _has_any(low, ["охватн", "самые охватные", "максимальный охват", "coverage"]) else ""
+
+        parts = [f"budget={int(budget)}", f"city={city}", f"n={n}", f"days={days}"]
+        if fmts:   parts.append(f"format={','.join(sorted(set(fmts)))}")
+        if owners: parts.append(f"owner={','.join(owners)}")
+        if "grp_min" in thr: parts.append(f"grp_min={int(thr['grp_min']) if thr['grp_min'].is_integer() else thr['grp_min']}")
+        if "ots_min" in thr: parts.append(f"ots_min={int(thr['ots_min']) if thr['ots_min'].is_integer() else thr['ots_min']}")
+
+        cmd = "/plan " + " ".join(parts) + top
+        return cmd, "Планирование кампании под бюджет"
+    
+    if _has_any(low, ["подбери", "выбери", "нужно", "хочу"]) and _has_any(low, ["в ", "по ", "из "]):
+        city_raw = _extract_city(t)
+        if city_raw:
+            city = _normalize_city_token(city_raw)
+            n = _parse_int(low) or 20
+            fmts = _extract_formats(low)
+            owners = _extract_owners(t)
+            thr = _extract_thresholds(t)  # <<< NEW
+            fmt_part = f" format={','.join(sorted(set(fmts)))}" if fmts else ""
+            own_part = f" owner={','.join(owners)}" if owners else ""
+            thr_part = ""
+            if "grp_min" in thr: thr_part += f" grp_min={int(thr['grp_min']) if thr['grp_min'].is_integer() else thr['grp_min']}"
+            if "ots_min" in thr: thr_part += f" ots_min={int(thr['ots_min']) if thr['ots_min'].is_integer() else thr['ots_min']}"
+            return f"/pick_city {city} {n}{fmt_part}{own_part}{thr_part}", "Равномерная выборка по городу с порогами"
+    
+    
+    
     if _has_any(low, ["сколько показ", "прогноз", "forecast", "хватит ли", "оценка показов"]):
         budget = _parse_money(low)
         if budget:
