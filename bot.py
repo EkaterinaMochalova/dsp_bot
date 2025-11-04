@@ -557,15 +557,37 @@ def _format_mask(series: pd.Series, token: str) -> pd.Series:
     return col == t
 
 def apply_filters(df: pd.DataFrame, kwargs: dict[str, str]) -> pd.DataFrame:
-    out = df
+    out = df.copy()
 
-    # ---------- FORMAT ----------
+    # -------- helpers --------
+    def _numify_series(s: pd.Series) -> pd.Series:
+        """'12 345,6' -> 12345.6 ; '50k' -> 50000 ; пустые -> NaN"""
+        x = s.astype(str).str.strip()
+        # убрать пробелы/nbsp
+        x = x.str.replace("\u00A0", "", regex=False).str.replace(" ", "", regex=False)
+        # запятая -> точка
+        x = x.str.replace(",", ".", regex=False)
+        # суффиксы k/m
+        def _to_float(v: str) -> float | None:
+            if v is None or v == "" or v.lower() == "nan":
+                return None
+            mul = 1.0
+            if v[-1:].lower() == "k":
+                mul, v = 1_000.0, v[:-1]
+            elif v[-1:].lower() == "m":
+                mul, v = 1_000_000.0, v[:-1]
+            try:
+                return float(v) * mul
+            except Exception:
+                return None
+        return pd.to_numeric(x.map(_to_float), errors="coerce")
+
+    # -------- FORMAT --------
     fmt_val = kwargs.get("format") or kwargs.get("formats") or kwargs.get("format_in")
     if fmt_val and "format" in out.columns:
-        fmt_list_raw = parse_list(fmt_val)
-        fmt_list = [s.upper() for s in fmt_list_raw]
-        mask = None
+        fmt_list = [t.strip().upper() for t in re.split(r"[;,|]", str(fmt_val)) if t.strip()]
         col = out["format"].astype(str).str.upper()
+        mask = None
         for f in fmt_list:
             if f.lower() in {"city", "city_format", "cityformat", "citylight", "гид", "гиды"}:
                 m = col.str.startswith("CITY_FORMAT")
@@ -575,41 +597,41 @@ def apply_filters(df: pd.DataFrame, kwargs: dict[str, str]) -> pd.DataFrame:
         if mask is not None:
             out = out[mask]
 
-    # ---------- OWNER (подстрока, регистронезависимо) ----------
+    # -------- OWNER --------
     own_val = kwargs.get("owner") or kwargs.get("owners") or kwargs.get("owner_in")
     if own_val and "owner" in out.columns:
-        owners = parse_list(own_val)
-        mask = None
+        owners = [t.strip().lower() for t in re.split(r"[;,|]", str(own_val)) if t.strip()]
         col = out["owner"].astype(str).str.lower()
+        mask = None
         for o in owners:
-            p = o.strip().lower()
-            if not p:
-                continue
-            m = col.str.contains(re.escape(p), na=False)
+            m = col.str.contains(re.escape(o), na=False)
             mask = m if mask is None else (mask | m)
         if mask is not None:
             out = out[mask]
 
-    # ---------- GRP MIN ----------
-    if "grp_min" in kwargs and "grp" in out.columns:
+    # -------- GRP_MIN --------
+    grp_min_raw = kwargs.get("grp_min") or kwargs.get("min_grp")
+    if grp_min_raw and "grp" in out.columns:
         try:
-            gmin = float(str(kwargs["grp_min"]).replace(",", "."))
-            grp_vals = pd.to_numeric(out["grp"], errors="coerce")
-            out = out[grp_vals >= gmin]
+            grp_min = float(str(grp_min_raw).replace(" ", "").replace(",", "."))
         except Exception:
-            pass
+            grp_min = None
+        if grp_min is not None:
+            grp_num = _numify_series(out["grp"])
+            out = out[grp_num.ge(grp_min).fillna(False)]
 
-    # ---------- OTS MIN ----------
-    if "ots_min" in kwargs and "ots" in out.columns:
+    # -------- OTS_MIN --------
+    ots_min_raw = kwargs.get("ots_min") or kwargs.get("min_ots")
+    if ots_min_raw and "ots" in out.columns:
         try:
-            omin = float(str(kwargs["ots_min"]).replace(",", "."))
-            ots_vals = pd.to_numeric(out["ots"], errors="coerce")
-            out = out[ots_vals >= omin]
+            ots_min = float(str(ots_min_raw).replace(" ", "").replace(",", "."))
         except Exception:
-            pass
+            ots_min = None
+        if ots_min is not None:
+            ots_num = _numify_series(out["ots"])
+            out = out[ots_num.ge(ots_min).fillna(False)]
 
     return out
-
 
 # Разбивка длинного ответа на части
 async def send_lines(message: types.Message, lines: list[str], header: str | None = None, chunk: int = 60, parse_mode: str | None = None):
