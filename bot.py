@@ -559,45 +559,46 @@ def _format_mask(series: pd.Series, token: str) -> pd.Series:
 def apply_filters(df: pd.DataFrame, kwargs: dict[str, str]) -> pd.DataFrame:
     out = df.copy()
 
-    # -------- helpers --------
+    # ---------- helpers ----------
     def _numify_series(s: pd.Series) -> pd.Series:
-        """'12 345,6' -> 12345.6 ; '50k' -> 50000 ; пустые -> NaN"""
+        """
+        Приводит к float:
+        '12 345,6' -> 12345.6,  '50k' -> 50000,  '1.2m'/'1,2m' -> 1200000,
+        пустые/мусор -> NaN.
+        """
         x = s.astype(str).str.strip()
-        # убрать пробелы/nbsp
-        x = x.str.replace("\u00A0", "", regex=False).str.replace(" ", "", regex=False)
-        # запятая -> точка
-        x = x.str.replace(",", ".", regex=False)
-        # суффиксы k/m
+        x = x.str.replace("\u00A0", "", regex=False).str.replace(" ", "", regex=False)  # убираем пробелы/nbsp
+        x = x.str.replace(",", ".", regex=False)                                        # запятая -> точка
+
         def _to_float(v: str) -> float | None:
-            if v is None or v == "" or v.lower() == "nan":
+            if not v or v.lower() in {"nan", "none", "—", "-", ""}:
                 return None
             mul = 1.0
-            if v[-1:].lower() == "k":
-                mul, v = 1_000.0, v[:-1]
-            elif v[-1:].lower() == "m":
-                mul, v = 1_000_000.0, v[:-1]
+            last = v[-1:].lower()
+            if last == "k":
+                v, mul = v[:-1], 1_000.0
+            elif last == "m":
+                v, mul = v[:-1], 1_000_000.0
             try:
                 return float(v) * mul
             except Exception:
                 return None
+
         return pd.to_numeric(x.map(_to_float), errors="coerce")
 
-    # -------- FORMAT --------
+    # ---------- FORMAT ----------
     fmt_val = kwargs.get("format") or kwargs.get("formats") or kwargs.get("format_in")
     if fmt_val and "format" in out.columns:
-        fmt_list = [t.strip().upper() for t in re.split(r"[;,|]", str(fmt_val)) if t.strip()]
+        tokens = [t.strip().upper() for t in re.split(r"[;,|]", str(fmt_val)) if t.strip()]
         col = out["format"].astype(str).str.upper()
         mask = None
-        for f in fmt_list:
-            if f.lower() in {"city", "city_format", "cityformat", "citylight", "гид", "гиды"}:
-                m = col.str.startswith("CITY_FORMAT")
-            else:
-                m = (col == f)
+        for f in tokens:
+            m = col.str.startswith("CITY_FORMAT") if f.lower() in {"city","city_format","cityformat","citylight","гид","гиды"} else (col == f)
             mask = m if mask is None else (mask | m)
         if mask is not None:
             out = out[mask]
 
-    # -------- OWNER --------
+    # ---------- OWNER ----------
     own_val = kwargs.get("owner") or kwargs.get("owners") or kwargs.get("owner_in")
     if own_val and "owner" in out.columns:
         owners = [t.strip().lower() for t in re.split(r"[;,|]", str(own_val)) if t.strip()]
@@ -609,7 +610,7 @@ def apply_filters(df: pd.DataFrame, kwargs: dict[str, str]) -> pd.DataFrame:
         if mask is not None:
             out = out[mask]
 
-    # -------- GRP_MIN --------
+    # ---------- GRP_MIN ----------
     grp_min_raw = kwargs.get("grp_min") or kwargs.get("min_grp")
     if grp_min_raw and "grp" in out.columns:
         try:
@@ -620,7 +621,7 @@ def apply_filters(df: pd.DataFrame, kwargs: dict[str, str]) -> pd.DataFrame:
             grp_num = _numify_series(out["grp"])
             out = out[grp_num.ge(grp_min).fillna(False)]
 
-    # -------- OTS_MIN --------
+    # ---------- OTS_MIN ----------
     ots_min_raw = kwargs.get("ots_min") or kwargs.get("min_ots")
     if ots_min_raw and "ots" in out.columns:
         try:
