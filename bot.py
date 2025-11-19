@@ -2407,17 +2407,83 @@ async def cmd_near(m: types.Message):
         lines.append(f"• {sid} — {name} ({dist} км) [{fmt} / {own}]")
     await send_lines(m, lines, header=f"Найдено: {len(res)} экр. в радиусе {radius} км", chunk=60)
 
+
+async def send_gid_if_any(
+    m: types.Message,
+    df: pd.DataFrame | None,
+    filename: str = "gid.xlsx",
+    caption: str = ""
+):
+    """
+    Формирует XLSX-файл с колонкой screen_id из df и отправляет его как документ.
+    Берём именно screen_id (из CSV/API-инвентаря), а не внутренние id.
+    """
+    if df is None or df.empty:
+        print("send_gid_if_any: df is None or empty")
+        return
+
+    if "screen_id" not in df.columns:
+        print("send_gid_if_any: no 'screen_id' column. Columns:", list(df.columns))
+        await m.answer("Не могу сформировать GID: в данных нет столбца `screen_id`.")
+        return
+
+    try:
+        export = (
+            df[["screen_id"]]
+            .dropna()
+            .astype(str)
+            .drop_duplicates()
+            .reset_index(drop=True)
+        )
+
+        if export.empty:
+            print("send_gid_if_any: export is empty after cleaning")
+            await m.answer("Не нашлось screen_id для формирования файла.")
+            return
+
+        buf = io.BytesIO()
+        export.to_excel(buf, index=False)
+        buf.seek(0)
+
+        input_file = BufferedInputFile(buf.getvalue(), filename=filename)
+
+        await m.answer_document(
+            input_file,
+            caption=caption or filename
+        )
+
+        print(f"send_gid_if_any: sent {len(export)} rows as {filename}")
+
+    except Exception as e:
+        print("send_gid_if_any ERROR:", repr(e))
+        await m.answer(f"Не смог прикрепить файл с GID: {e}")
+
 # ---------- pick_city ----------
 @router.message(Command("pick_city"))
 async def pick_city(m: types.Message):
+    """
+    /pick_city Город N [format=...] [owner=...] [fields=...] [shuffle=1] [fixed=1] [seed=42]
+
+    - выбирает N экранов в заданном городе (равномерно spread_select)
+    - может фильтровать по format/owner/другим полям через apply_filters
+    - если fields=screen_id — шлёт список ID текстом
+    - всегда в конце пытается отправить XLSX с колонкой screen_id
+    """
+
     global LAST_RESULT, SCREENS
+
+    # 1. Проверяем, что инвентарь загружен
     if SCREENS is None or SCREENS.empty:
         await m.answer("Сначала загрузите инвентарь (CSV/XLSX или /sync_api).")
         return
 
+    # 2. Разбор аргументов команды
     parts = (m.text or "").strip().split()
     if len(parts) < 3:
-        await m.answer("Формат: /pick_city Город N [format=...] [owner=...] [fields=...] [shuffle=1] [fixed=1] [seed=42]")
+        await m.answer(
+            "Формат: /pick_city Город N "
+            "[format=...] [owner=...] [fields=...] [shuffle=1] [fixed=1] [seed=42]"
+        )
         return
 
     pos, keyvals = [], []
@@ -2425,59 +2491,118 @@ async def pick_city(m: types.Message):
         (keyvals if "=" in p else pos).append(p)
 
     try:
+        # последний позиционный аргумент — N, всё остальное до него — название города
         n = int(pos[-1])
         city = " ".join(pos[:-1]) if len(pos) > 1 else ""
+
         kwargs = parse_kwargs(keyvals)
-        shuffle_flag = str(kwargs.get("shuffle", "0")).lower() in {"1","true","yes","on"}
-        fixed        = str(kwargs.get("fixed",   "0")).lower() in {"1","true","yes","on"}
-        seed         = int(kwargs["seed"]) if str(kwargs.get("seed","")).isdigit() else None
+
+        shuffle_flag = str(kwargs.get("shuffle", "0")).lower() in {"1", "true", "yes", "on"}
+        fixed        = str(kwargs.get("fixed",   "0")).lower() in {"1", "true", "yes", "on"}
+        seed         = int(kwargs["seed"]) if str(kwargs.get("seed", "")).isdigit() else None
+
     except Exception:
         await m.answer("Пример: /pick_city Москва 20 format=BILLBOARD fields=screen_id shuffle=1")
         return
 
+    if not city.strip():
+        await m.answer("Нужно указать город, пример: /pick_city Москва 20")
+        return
+
+    # 3. Проверяем наличие столбца city
     if "city" not in SCREENS.columns:
         await m.answer("В данных нет столбца city. Используйте /near или /sync_api с нормализацией.")
         return
 
-    subset = SCREENS[SCREENS["city"].astype(str).str.strip().str.lower() == city.strip().lower()]
-    subset = apply_filters(subset, kwargs) if not subset.empty and kwargs else subset
+    # 4. Фильтрация по городу и дополнительным фильтрам
+    subset = SCREENS[
+        SCREENS["city"].astype(str).str.strip().str.lower()
+        == city.strip().lower()
+    ]
+
+    if kwargs:
+        subset = apply_filters(subset, kwargs) if not subset.empty else subset
 
     if subset.empty:
         await m.answer(f"Не нашёл экранов в городе: {city} (с учётом фильтров).")
         return
 
+    # 5. Перемешивание перед spread_select (если нужно)
     if shuffle_flag:
         subset = subset.sample(frac=1, random_state=None).reset_index(drop=True)
 
-    res = spread_select(subset.reset_index(drop=True), n, random_start=not fixed, seed=seed)
+    # 6. Основной выбор экранов
+    res = spread_select(
+        subset.reset_index(drop=True),
+        n,
+        random_start=not fixed,
+        seed=seed,
+    )
     LAST_RESULT = res
 
-    fields = parse_fields(kwargs.get("fields","")) if "fields" in kwargs else []
+    # 7. Формирование текстового ответа
+    fields = parse_fields(kwargs.get("fields", "")) if "fields" in kwargs else []
+
     if fields:
         view = res[fields]
+
+        # Специальный кейс: только screen_id -> компактный список
         if fields == ["screen_id"]:
-            # берём строго Series; при дубликатах колонок используем первую слайсом
             ser = res["screen_id"] if "screen_id" in res.columns else pd.Series(dtype=str)
             if isinstance(ser, pd.DataFrame):
                 ser = ser.iloc[:, 0]
+
             ids = [s for s in ser.astype(str).tolist() if s and s.lower() != "nan"]
-            await send_lines(m, ids, header=f"Выбрано {len(ids)} screen_id по городу «{city}»:")
+
+            await send_lines(
+                m,
+                ids,
+                header=f"Выбрано {len(ids)} screen_id по городу «{city}»:"
+            )
         else:
-            lines = [" | ".join(str(row[c]) for c in fields) for _, row in view.iterrows()]
-            await send_lines(m, lines, header=f"Выбрано {len(view)} экранов по городу «{city}» (поля: {', '.join(fields)}):")
+            lines = [
+                " | ".join(str(row[c]) for c in fields)
+                for _, row in view.iterrows()
+            ]
+            await send_lines(
+                m,
+                lines,
+                header=(
+                    f"Выбрано {len(view)} экранов по городу «{city}» "
+                    f"(поля: {', '.join(fields)}):"
+                ),
+            )
+
     else:
-        lines = []
+        # Красивый человекочитаемый список с координатами и форматом
+        lines: list[str] = []
         for _, r in res.iterrows():
-            nm  = r.get("name","") or r.get("screen_id","")
-            fmt = r.get("format","") or ""
-            own = r.get("owner","") or ""
+            nm  = r.get("name", "") or r.get("screen_id", "")
+            fmt = r.get("format", "") or ""
+            own = r.get("owner", "") or ""
             md  = r.get("min_dist_to_others_km", None)
             tail = f"(мин. до соседа {md} км)" if md is not None else ""
-            lines.append(f"• {r.get('screen_id','')} — {nm} [{r['lat']:.5f},{r['lon']:.5f}] [{fmt} / {own}] {tail}".strip())
-        await send_lines(m, lines, header=f"Выбрано {len(res)} экранов по городу «{city}» (равномерно):")
+            lines.append(
+                f"• {r.get('screen_id', '')} — {nm} "
+                f"[{r['lat']:.5f},{r['lon']:.5f}] "
+                f"[{fmt} / {own}] {tail}".strip()
+            )
 
-    await send_gid_if_any(m, res, filename="city_screen_ids.xlsx", caption=f"GID по городу «{city}» (XLSX)")
+        await send_lines(
+            m,
+            lines,
+            header=f"Выбрано {len(res)} экранов по городу «{city}» (равномерно):"
+        )
 
+    # 8. И сразу — файл с GID (screen_id) по результату
+    await send_gid_if_any(
+        m,
+        res,
+        filename=f"gid_{city}_screen_ids.xlsx",
+        caption=f"GID по городу «{city}» (XLSX)",
+    )
+
+    
 # ---------- pick_at ----------
 def parse_mix(val: str) -> list[tuple[str, str]]:
     if not isinstance(val, str) or not val.strip():
