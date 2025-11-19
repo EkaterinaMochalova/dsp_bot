@@ -2462,12 +2462,11 @@ async def send_gid_if_any(
 @router.message(Command("pick_city"))
 async def pick_city(m: types.Message):
     """
-    /pick_city Город N [format=...] [owner=...] [fields=...] [shuffle=1] [fixed=1] [seed=42]
+    /pick_city Город N [format=...] [owner=...] [shuffle=1] [fixed=1] [seed=42]
 
     - выбирает N экранов в заданном городе (равномерно spread_select)
     - может фильтровать по format/owner/другим полям через apply_filters
-    - если fields=screen_id — шлёт список ID текстом
-    - всегда в конце пытается отправить XLSX с колонкой screen_id
+    - при успешном выполнении отправляет ТОЛЬКО XLSX с колонкой screen_id
     """
 
     global LAST_RESULT, SCREENS
@@ -2482,7 +2481,7 @@ async def pick_city(m: types.Message):
     if len(parts) < 3:
         await m.answer(
             "Формат: /pick_city Город N "
-            "[format=...] [owner=...] [fields=...] [shuffle=1] [fixed=1] [seed=42]"
+            "[format=...] [owner=...] [shuffle=1] [fixed=1] [seed=42]"
         )
         return
 
@@ -2502,7 +2501,7 @@ async def pick_city(m: types.Message):
         seed         = int(kwargs["seed"]) if str(kwargs.get("seed", "")).isdigit() else None
 
     except Exception:
-        await m.answer("Пример: /pick_city Москва 20 format=BILLBOARD fields=screen_id shuffle=1")
+        await m.answer("Пример: /pick_city Москва 20 format=BILLBOARD shuffle=1")
         return
 
     if not city.strip():
@@ -2540,61 +2539,7 @@ async def pick_city(m: types.Message):
     )
     LAST_RESULT = res
 
-    # 7. Формирование текстового ответа
-    fields = parse_fields(kwargs.get("fields", "")) if "fields" in kwargs else []
-
-    if fields:
-        view = res[fields]
-
-        # Специальный кейс: только screen_id -> компактный список
-        if fields == ["screen_id"]:
-            ser = res["screen_id"] if "screen_id" in res.columns else pd.Series(dtype=str)
-            if isinstance(ser, pd.DataFrame):
-                ser = ser.iloc[:, 0]
-
-            ids = [s for s in ser.astype(str).tolist() if s and s.lower() != "nan"]
-
-            await send_lines(
-                m,
-                ids,
-                header=f"Выбрано {len(ids)} screen_id по городу «{city}»:"
-            )
-        else:
-            lines = [
-                " | ".join(str(row[c]) for c in fields)
-                for _, row in view.iterrows()
-            ]
-            await send_lines(
-                m,
-                lines,
-                header=(
-                    f"Выбрано {len(view)} экранов по городу «{city}» "
-                    f"(поля: {', '.join(fields)}):"
-                ),
-            )
-
-    else:
-        # Красивый человекочитаемый список с координатами и форматом
-        lines: list[str] = []
-        for _, r in res.iterrows():
-            nm  = r.get("name", "") or r.get("screen_id", "")
-            fmt = r.get("format", "") or ""
-            own = r.get("owner", "") or ""
-            md  = r.get("min_dist_to_others_km", None)
-            tail = f"(мин. до соседа {md} км)" if md is not None else ""
-            lines.append(
-                f"• {r.get('screen_id', '')} — {nm} "
-                f"[{r['lat']:.5f},{r['lon']:.5f}] "
-                f"[{fmt} / {own}] {tail}".strip()
-            )
-
-        await send_lines(
-            m,
-            lines,
-            header=f"Выбрано {len(res)} экранов по городу «{city}» (равномерно):"
-        )
-
-    # 8. И сразу — файл с GID (screen_id) по результату
+    # 7. Никакого текстового списка — сразу шлём файл с screen_id
     await send_gid_if_any(
         m,
         res,
@@ -2602,7 +2547,6 @@ async def pick_city(m: types.Message):
         caption=f"GID по городу «{city}» (XLSX)",
     )
 
-    
 # ---------- pick_at ----------
 def parse_mix(val: str) -> list[tuple[str, str]]:
     if not isinstance(val, str) or not val.strip():
