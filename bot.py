@@ -2658,6 +2658,8 @@ def _select_with_mix(df_city: pd.DataFrame, n: int, mix_arg: str | None,
         combined = pd.concat([combined, extra], ignore_index=True)
     return combined.head(n)
 
+# ---------- pick_at ----------
+
 @router.message(Command("pick_at"))
 async def pick_at(m: types.Message):
     global LAST_RESULT, SCREENS
@@ -2667,7 +2669,7 @@ async def pick_at(m: types.Message):
 
     parts = (m.text or "").strip().split()
     if len(parts) < 4:
-        await m.answer("Формат: /pick_at lat lon N [radius_km] [mix=...] [fixed=1] [seed=42]")
+        await m.answer("Формат: /pick_at lat lon N [radius_km] [mix=...] [format=...] [fixed=1] [seed=42]")
         return
 
     try:
@@ -2675,31 +2677,76 @@ async def pick_at(m: types.Message):
         n = int(parts[3])
         radius = float(parts[4]) if len(parts) >= 5 and "=" not in parts[4] else 20.0
         kwargs = parse_kwargs(parts[5:] if len(parts) > 5 else [])
+
+        fixed = str(kwargs.get("fixed", "0")).lower() in {"1","true","yes","on"}
+        seed = int(kwargs["seed"]) if str(kwargs.get("seed","")).isdigit() else None
+        mix_arg = kwargs.get("mix") or kwargs.get("mix_formats")
+        fmt_arg = kwargs.get("format")  # ← вот это нам и нужно
     except Exception:
-        await m.answer("Пример: /pick_at 55.75 37.62 30 15")
+        await m.answer("Пример: /pick_at 55.75 37.62 30 15 format=BILLBOARD")
         return
 
+    # 1. Базовый круг по радиусу
     circle = find_within_radius(SCREENS, (lat, lon), radius)
     if circle.empty:
         await m.answer(f"В радиусе {radius} км нет экранов.")
         return
 
-    fixed = str(kwargs.get("fixed", "0")).lower() in {"1","true","yes","on"}
-    seed = int(kwargs["seed"]) if kwargs.get("seed","").isdigit() else None
-    mix_arg = kwargs.get("mix") or kwargs.get("mix_formats")
+    # 2. Если передан format=..., явно отфильтруем по формату
+    if fmt_arg and "format" in circle.columns:
+        # поддержим несколько токенов, через , ; |, как в mix
+        raw = str(fmt_arg)
+        tokens = [t.strip() for t in raw.replace("|", ",").replace(";", ",").split(",") if t.strip()]
+        if tokens:
+            col = circle["format"].astype(str)
+            mask = None
+            for tok in tokens:
+                # если у тебя есть _format_mask — используем её,
+                # чтобы совпадало поведение с mix / _select_with_mix
+                m_tok = _format_mask(col, tok)
+                mask = m_tok if mask is None else (mask | m_tok)
+            if mask is not None:
+                circle = circle[mask]
 
-    res = _select_with_mix(circle.reset_index(drop=True), n, mix_arg, random_start=not fixed, seed=seed)
+    if circle.empty:
+        await m.answer(f"В радиусе {radius} км нет экранов с форматом {fmt_arg!r}.")
+        return
+
+    # 3. Выбор с mix (если указан) или обычный spread_select
+    res = _select_with_mix(
+        circle.reset_index(drop=True),
+        n,
+        mix_arg,
+        random_start=not fixed,
+        seed=seed,
+    )
     LAST_RESULT = res
 
+    # 4. Текстовый список (как был) + GID-файл
     lines = []
     for _, r in res.iterrows():
         nm = r.get("name","") or r.get("screen_id","")
-        fmt = r.get("format",""); own = r.get("owner","")
+        fmt = r.get("format","")
+        own = r.get("owner","")
         md  = r.get("min_dist_to_others_km", 0)
-        lines.append(f"• {r.get('screen_id','')} — {nm} [{r['lat']:.5f},{r['lon']:.5f}] [{fmt} / {own}] (мин. до соседа {md} км)")
-    await send_lines(m, lines, header=f"Выбрано {len(res)} экранов равномерно в радиусе {radius} км:")
+        lines.append(
+            f"• {r.get('screen_id','')} — {nm} "
+            f"[{r['lat']:.5f},{r['lon']:.5f}] "
+            f"[{fmt} / {own}] (мин. до соседа {md} км)"
+        )
 
-    await send_gid_if_any(m, res, filename="picked_at_screen_ids.xlsx", caption="GID (XLSX)")
+    await send_lines(
+        m,
+        lines,
+        header=f"Выбрано {len(res)} экранов равномерно в радиусе {radius} км:"
+    )
+
+    await send_gid_if_any(
+        m,
+        res,
+        filename="picked_at_screen_ids.xlsx",
+        caption="GID (XLSX)",
+    )
 
 # ---------- Export last ----------
 async def send_gid_xlsx(chat_id: int, ids: list[str], *, filename: str = "screen_ids.xlsx", caption: str = "GID список (XLSX)"):
