@@ -878,6 +878,7 @@ def _normalize_api_to_df(items: list[dict]) -> pd.DataFrame:
             "width_mm","height_mm","width_px","height_px",
             "phys_width_px","phys_height_px",
             "sspProvider","sspTypes","minBid","ots","grp","meta_format",
+            "estimated_ots","interpolated_ots","ssp_ots",
             "image_url","image_preview"
         ])
 
@@ -922,6 +923,12 @@ def _normalize_api_to_df(items: list[dict]) -> pd.DataFrame:
             "ots":    g(it, ["minBidInfo","ots"]),
             "grp":    g(it, ["metadata","grp"]),
             "meta_format": g(it, ["metadata","format"]),
+
+            # NEW: estimated OTS from detail (or if вдруг уже есть в item)
+            "estimated_ots":     it.get("estimatedOts")     if it.get("estimatedOts") is not None else g(it, ["metadata","otsInfo","estimatedOts"]),
+            "interpolated_ots":  it.get("interpolatedOts")  if it.get("interpolatedOts") is not None else g(it, ["metadata","otsInfo","interpolatedOts"]),
+            "ssp_ots":           it.get("sspOts")           if it.get("sspOts") is not None else g(it, ["metadata","otsInfo","sspOts"]),
+
             "image_url":     g(it, ["images", 0, "url"]),
             "image_preview": g(it, ["images", 0, "preview"]),
         })
@@ -931,10 +938,18 @@ def _normalize_api_to_df(items: list[dict]) -> pd.DataFrame:
     for c in ("lat","lon"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # OTS тоже приведём к числам (удобно для Excel/фильтров)
+    for c in ("estimated_ots","interpolated_ots","ssp_ots","ots","grp","minBid"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
     # на всякий — уберём мусорные строки без координат
     if {"lat","lon"}.issubset(df.columns):
         df = df.dropna(subset=["lat","lon"]).reset_index(drop=True)
+
     return df
+
 
 # ====== API: фотоотчёты ======
 async def _fetch_impression_shots(
@@ -1789,7 +1804,7 @@ async def cmd_sync_api(m: types.Message):
         return default
 
     def _as_list(s):
-        return [x.strip() for x in str(s).replace(";",",").replace("|",",").split(",") if x.strip()] if s else []
+        return [x.strip() for x in str(s).replace(";", ",").replace("|", ",").split(",") if x.strip()] if s else []
 
     pages_limit = _get_opt("pages", int, None)
     page_size   = _get_opt("size", int, 500)
@@ -1798,6 +1813,9 @@ async def cmd_sync_api(m: types.Message):
     city     = _get_opt("city", str, "").strip()
     formats  = _as_list(_get_opt("formats", str, "") or _get_opt("format", str, ""))
     owners   = _as_list(_get_opt("owners", str, "")  or _get_opt("owner", str, ""))
+
+    # ots=1 -> enrich metadata.otsInfo.* via detail endpoint
+    enrich_ots = _get_opt("ots", int, 0) == 1 or (_get_opt("enrich", str, "").strip().lower() in {"ots", "estimatedots"})
 
     raw_api = {}
     for p in parts:
@@ -1812,6 +1830,7 @@ async def cmd_sync_api(m: types.Message):
     if formats: pretty.append(f"formats={','.join(formats)}")
     if owners:  pretty.append(f"owners={','.join(owners)}")
     if raw_api: pretty.append("+" + "&".join(f"{k}={v}" for k, v in raw_api.items()))
+    if enrich_ots: pretty.append("ots=1")
     hint = (" (фильтры: " + ", ".join(pretty) + ")") if pretty else ""
     await m.answer("⏳ Тяну инвентарь из внешнего API…" + hint)
 
@@ -1831,6 +1850,14 @@ async def cmd_sync_api(m: types.Message):
     if not items:
         await m.answer("API вернул пустой список.")
         return
+
+    if enrich_ots:
+        try:
+            await m.answer("🧠 Догружаю OTS (metadata.otsInfo.estimatedOts) по каждому экрану…")
+            items = await _enrich_items_with_ots_info(items, m=m)
+        except Exception as e:
+            logging.exception("enrich ots failed")
+            await m.answer(f"⚠️ Догрузка OTS частично не удалась: {e}")
 
     df = _normalize_api_to_df(items)
     if df.empty:
@@ -1873,6 +1900,114 @@ async def cmd_sync_api(m: types.Message):
         await m.answer(f"⚠️ Не удалось отправить XLSX: {e} (проверь, установлен ли openpyxl)")
 
     await m.answer(f"✅ Синхронизация ок: {len(df)} экранов.")
+
+
+# ---------- Enrich OTS info from detail endpoint ----------
+DETAIL_URL_TMPL = "https://proddsp.omniboard360.io/api/v1.0/clients/inventories/{inv_id}"
+
+async def _enrich_items_with_ots_info(
+    items: list[dict],
+    m: types.Message | None = None,
+    concurrency: int = 12,
+    timeout_s: int = 20,
+) -> list[dict]:
+    import asyncio
+    import aiohttp
+    import random
+
+    sem = asyncio.Semaphore(concurrency)
+
+    def _extract_id(it: dict):
+        v = it.get("id") or it.get("inventoryId") or it.get("inventory_id") or it.get("inventorId")
+        try:
+            return int(v) if v is not None else None
+        except Exception:
+            return None
+
+    def _extract_ots_info(data: dict) -> dict:
+        md = (data.get("metadata") or {})
+        ots_info = (md.get("otsInfo") or {})
+        return {
+            "estimatedOts": ots_info.get("estimatedOts"),
+            "interpolatedOts": ots_info.get("interpolatedOts"),
+            "sspOts": ots_info.get("sspOts"),
+        }
+
+    base = (OBDSP_BASE or "https://proddsp.omniboard360.io").rstrip("/")
+    root = f"{base}/api/v1.0/clients/inventories/{{inv_id}}"
+    headers = {**_auth_headers(), "Accept": "application/json"}
+    ssl_param = _make_ssl_param_for_aiohttp()
+
+    ids: list[int] = []
+    for it in items:
+        inv_id = _extract_id(it)
+        if inv_id is not None:
+            ids.append(inv_id)
+
+    total = len(ids)
+    if m:
+        await m.answer(f"📌 Экранов для догрузки OTS: {total}")
+
+    async def _fetch_one(session: aiohttp.ClientSession, inv_id: int):
+        url = root.format(inv_id=inv_id)
+        async with sem:
+            # небольшой джиттер, чтобы не бить API ровными очередями
+            await asyncio.sleep(random.random() * 0.05)
+            try:
+                async with session.get(url, headers=headers, ssl=ssl_param, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return inv_id, _extract_ots_info(data), None
+
+                    # мягкая обработка rate limit / временных ошибок
+                    txt = await resp.text()
+                    if resp.status in (429, 500, 502, 503, 504):
+                        return inv_id, None, f"retryable HTTP {resp.status}: {txt[:120]}"
+                    return inv_id, None, f"HTTP {resp.status}: {txt[:120]}"
+            except Exception as e:
+                return inv_id, None, str(e)
+
+    results: dict[int, dict] = {}
+    errors = 0
+    retryable = 0
+
+    timeout = aiohttp.ClientTimeout(total=max(180, timeout_s))
+    connector = aiohttp.TCPConnector(limit=concurrency * 2, ssl=False)
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        tasks = [_fetch_one(session, inv_id) for inv_id in ids]
+        done = 0
+        for coro in asyncio.as_completed(tasks):
+            inv_id, ots_info, err = await coro
+            if ots_info is None:
+                errors += 1
+                if err and err.startswith("retryable"):
+                    retryable += 1
+                results[inv_id] = {"estimatedOts": None, "interpolatedOts": None, "sspOts": None}
+            else:
+                results[inv_id] = ots_info
+
+            done += 1
+            if m and done % 200 == 0:
+                await m.answer(f"…OTS: {done}/{total} (ошибок: {errors}, из них ретраебл: {retryable})")
+
+    # merge back to items
+    for it in items:
+        inv_id = _extract_id(it)
+        info = results.get(inv_id) if inv_id is not None else None
+        if not info:
+            it["estimatedOts"] = None
+            it["interpolatedOts"] = None
+            it["sspOts"] = None
+        else:
+            it["estimatedOts"] = info.get("estimatedOts")
+            it["interpolatedOts"] = info.get("interpolatedOts")
+            it["sspOts"] = info.get("sspOts")
+
+    if m:
+        await m.answer(f"✅ OTS догружен. Ошибок: {errors}/{total} (ретраебл: {retryable})")
+
+    return items
 
 # ---------- Фотоотчёты ----------
 @router.message(Command("shots"))
