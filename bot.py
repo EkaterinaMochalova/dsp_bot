@@ -2776,7 +2776,7 @@ def _select_with_mix(df_city: pd.DataFrame, n: int, mix_arg: str | None,
         selected_parts.append(picked)
 
         if "screen_id" in pool.columns and "screen_id" in picked.columns:
-            chosen_ids = picked["screen_id"].astype(str).tolist()
+            chosen_ids = _extract_screen_ids(picked)
             used_ids.update(chosen_ids)
             pool = pool[~pool["screen_id"].astype(str).isin(used_ids)]
         else:
@@ -2899,7 +2899,7 @@ async def send_gid_xlsx(chat_id: int, ids: list[str], *, filename: str = "screen
 async def send_gid_if_any(message: types.Message, df: pd.DataFrame, *, filename: str, caption: str):
     if df is None or df.empty or "screen_id" not in df.columns:
         return
-    ids = [s for s in (df["screen_id"].astype(str).tolist()) if str(s).strip() and str(s).lower() != "nan"]
+    ids = _extract_screen_ids(df)
     if ids:
         await send_gid_xlsx(message.chat.id, ids, filename=filename, caption=caption)
 
