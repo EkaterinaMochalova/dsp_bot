@@ -2937,7 +2937,7 @@ async def on_file(m: types.Message):
                 raise ValueError("Не удалось прочитать CSV — проверьте формат файла")
 
         rename_map = {
-            "Screen_ID":"screen_id","ScreenId":"screen_id","id":"screen_id","ID":"screen_id",
+            "Screen_ID":"screen_id","ScreenId":"screen_id",
             "Name":"name","Название":"name",
             "Latitude":"lat","Lat":"lat","Широта":"lat",
             "Longitude":"lon","Lon":"lon","Долгота":"lon",
@@ -2945,6 +2945,13 @@ async def on_file(m: types.Message):
             "Format":"format","Формат":"format",
             "Owner":"owner","Владелец":"owner","Оператор":"owner"
         }
+        # "id"/"ID" → screen_id только если колонки screen_id ещё нет
+        existing_cols_lower = [c.lower() for c in df.columns]
+        if "screen_id" not in existing_cols_lower:
+            for alias in ("id", "ID"):
+                if alias in df.columns:
+                    rename_map[alias] = "screen_id"
+                    break
         df = df.rename(columns=rename_map)
 
         if not {"lat","lon"}.issubset(df.columns):
