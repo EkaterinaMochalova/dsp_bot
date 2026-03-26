@@ -1640,6 +1640,7 @@ async def cmd_near_geo(m: types.Message):
             types.BufferedInputFile(csv_bytes, filename="near_geo_selection.csv"),
             caption=f"Экраны рядом с найденными POI (поля: {', '.join(cols)})"
         )
+        await send_gid_if_any(m, res, filename="near_geo_screen_ids.xlsx", caption="GID (XLSX)")
         return
 
     # человекочитаемый список (усекать, чтобы не словить “message is too long”)
@@ -1669,6 +1670,8 @@ async def cmd_near_geo(m: types.Message):
         )
     except Exception:
         pass
+
+    await send_gid_if_any(m, res, filename="near_geo_screen_ids.xlsx", caption="GID (XLSX)")
 
 
 # ---------- базовые команды ----------
@@ -2478,6 +2481,8 @@ async def cmd_plan(m: types.Message):
     except Exception as e:
         await m.answer(f"⚠️ Не удалось отправить XLSX: {e}")
 
+    await send_gid_if_any(m, selected, filename="plan_gid.xlsx", caption="GID (XLSX)")
+
 # ---------- Радиус, Near ----------
 @router.message(Command("radius"))
 async def set_radius(m: types.Message):
@@ -2524,13 +2529,6 @@ async def cmd_near(m: types.Message):
         return
 
     LAST_RESULT = res
-    if kwargs.get("fields", "").lower() == "screen_id":
-        ids = [str(x) for x in res.get("screen_id", pd.Series([""]*len(res))).tolist()]
-        if not ids:
-            await m.answer(f"Найдено {len(res)} экр., но колонка screen_id пустая.")
-            return
-        await send_lines(m, ids, header=f"Найдено {len(ids)} screen_id:", chunk=60)
-        return
 
     lines = []
     for _, r in res.iterrows():
@@ -2541,6 +2539,7 @@ async def cmd_near(m: types.Message):
         own  = r.get("owner", "")
         lines.append(f"• {sid} — {name} ({dist} км) [{fmt} / {own}]")
     await send_lines(m, lines, header=f"Найдено: {len(res)} экр. в радиусе {radius} км", chunk=60)
+    await send_gid_if_any(m, res, filename="near_screen_ids.xlsx", caption="GID (XLSX)")
 
 
 async def send_gid_if_any(
