@@ -2927,10 +2927,14 @@ async def on_file(m: types.Message):
         if m.document.file_name.lower().endswith(".xlsx"):
             df = pd.read_excel(io.BytesIO(data))
         else:
-            try:
-                df = pd.read_csv(io.BytesIO(data), encoding="utf-8-sig")
-            except Exception:
-                df = pd.read_csv(io.BytesIO(data))
+            for enc in ("utf-8-sig", "utf-8", "cp1251"):
+                try:
+                    df = pd.read_csv(io.BytesIO(data), encoding=enc, sep=None, engine="python")
+                    break
+                except Exception:
+                    continue
+            else:
+                raise ValueError("Не удалось прочитать CSV — проверьте формат файла")
 
         rename_map = {
             "Screen_ID":"screen_id","ScreenId":"screen_id","id":"screen_id","ID":"screen_id",
