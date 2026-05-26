@@ -124,6 +124,7 @@ HELP = (
     "• /cache_info — диагностика локального кэша\n"
     "• /sync_api [фильтры] — подтянуть инвентарь из API (если настроены переменные окружения)\n"
     "Например: /sync_api city=Москва — подтянуть экраны из API только по Москве\n"
+    "Азимут: /sync_api azimuth=6435,6436 — догрузить азимут из impression-inventory-stats для указанных кампаний\n"
     "• /export_last — выгрузить последнюю выборку (CSV)\n\n"
     
     "🔎 Выбрать экраны:\n"
@@ -879,6 +880,7 @@ def _normalize_api_to_df(items: list[dict]) -> pd.DataFrame:
             "phys_width_px","phys_height_px",
             "sspProvider","sspTypes","minBid","ots","grp","meta_format",
             "estimated_ots","interpolated_ots","ssp_ots",
+            "azimuth",
             "image_url","image_preview"
         ])
 
@@ -929,6 +931,7 @@ def _normalize_api_to_df(items: list[dict]) -> pd.DataFrame:
             "interpolated_ots":  it.get("interpolatedOts")  if it.get("interpolatedOts") is not None else g(it, ["metadata","otsInfo","interpolatedOts"]),
             "ssp_ots":           it.get("sspOts")           if it.get("sspOts") is not None else g(it, ["metadata","otsInfo","sspOts"]),
 
+            "azimuth":       it.get("azimuth"),
             "image_url":     g(it, ["images", 0, "url"]),
             "image_preview": g(it, ["images", 0, "preview"]),
         })
@@ -940,7 +943,7 @@ def _normalize_api_to_df(items: list[dict]) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # OTS тоже приведём к числам (удобно для Excel/фильтров)
-    for c in ("estimated_ots","interpolated_ots","ssp_ots","ots","grp","minBid"):
+    for c in ("estimated_ots","interpolated_ots","ssp_ots","ots","grp","minBid","azimuth"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -1820,6 +1823,18 @@ async def cmd_sync_api(m: types.Message):
     # ots=1 -> enrich metadata.otsInfo.* via detail endpoint
     enrich_ots = _get_opt("ots", int, 0) == 1 or (_get_opt("enrich", str, "").strip().lower() in {"ots", "estimatedots"})
 
+    # azimuth=<campaign_id1,campaign_id2> -> enrich azimuth from impression-inventory-stats
+    azimuth_raw = _get_opt("azimuth", str, "").strip()
+    azimuth_campaign_ids: list[int] = []
+    if azimuth_raw:
+        for x in azimuth_raw.replace(";", ",").split(","):
+            x = x.strip()
+            if x:
+                try:
+                    azimuth_campaign_ids.append(int(x))
+                except ValueError:
+                    pass
+
     raw_api = {}
     for p in parts:
         if p.startswith("api.") and "=" in p:
@@ -1834,6 +1849,7 @@ async def cmd_sync_api(m: types.Message):
     if owners:  pretty.append(f"owners={','.join(owners)}")
     if raw_api: pretty.append("+" + "&".join(f"{k}={v}" for k, v in raw_api.items()))
     if enrich_ots: pretty.append("ots=1")
+    if azimuth_campaign_ids: pretty.append(f"azimuth={','.join(str(c) for c in azimuth_campaign_ids)}")
     hint = (" (фильтры: " + ", ".join(pretty) + ")") if pretty else ""
     await m.answer("⏳ Тяну инвентарь из внешнего API…" + hint)
 
@@ -1861,6 +1877,14 @@ async def cmd_sync_api(m: types.Message):
         except Exception as e:
             logging.exception("enrich ots failed")
             await m.answer(f"⚠️ Догрузка OTS частично не удалась: {e}")
+
+    if azimuth_campaign_ids:
+        try:
+            await m.answer(f"🧭 Догружаю азимут из impression-inventory-stats (кампании: {azimuth_campaign_ids})…")
+            items = await _enrich_items_with_azimuth(items, azimuth_campaign_ids, m=m)
+        except Exception as e:
+            logging.exception("enrich azimuth failed")
+            await m.answer(f"⚠️ Догрузка азимута частично не удалась: {e}")
 
     df = _normalize_api_to_df(items)
     if df.empty:
@@ -2011,6 +2035,77 @@ async def _enrich_items_with_ots_info(
         await m.answer(f"✅ OTS догружен. Ошибок: {errors}/{total} (ретраебл: {retryable})")
 
     return items
+
+# ---------- Enrich azimuth from impression-inventory-stats ----------
+async def _enrich_items_with_azimuth(
+    items: list[dict],
+    campaign_ids: list[int],
+    m: types.Message | None = None,
+    page_size: int = 500,
+) -> list[dict]:
+    if not campaign_ids:
+        return items
+
+    base = (OBDSP_BASE or "https://proddsp.omniboard360.io").rstrip("/")
+    headers = {**_auth_headers(), "Accept": "application/json"}
+    ssl_param = _make_ssl_param_for_aiohttp()
+    timeout = aiohttp.ClientTimeout(total=180)
+
+    azimuth_map: dict[int, Any] = {}
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for cid in campaign_ids:
+            url = f"{base}/api/v1.0/clients/campaigns/{cid}/impression-inventory-stats"
+            page = 0
+            while True:
+                params: dict[str, Any] = {"page": page, "size": page_size}
+                try:
+                    async with session.get(url, headers=headers, params=params, ssl=ssl_param) as resp:
+                        if resp.status != 200:
+                            txt = await resp.text()
+                            if m:
+                                try: await m.answer(f"⚠️ Кампания {cid}: HTTP {resp.status}: {txt[:120]}")
+                                except: pass
+                            break
+                        data = await resp.json()
+                except Exception as e:
+                    if m:
+                        try: await m.answer(f"⚠️ Кампания {cid}: ошибка: {e}")
+                        except: pass
+                    break
+
+                if isinstance(data, list):
+                    page_items = data
+                    is_last = True
+                else:
+                    page_items = data.get("content") or []
+                    is_last = data.get("last", True)
+
+                for entry in page_items:
+                    inv = entry.get("inventory") or {}
+                    inv_id = inv.get("id")
+                    azimuth = inv.get("azimuth")
+                    if inv_id is not None:
+                        azimuth_map[int(inv_id)] = azimuth
+
+                if is_last or not page_items:
+                    break
+                page += 1
+
+    if m:
+        filled = sum(1 for v in azimuth_map.values() if v is not None)
+        try: await m.answer(f"🧭 Азимут загружен: {filled}/{len(azimuth_map)} экранов имеют значение.")
+        except: pass
+
+    for it in items:
+        try:
+            inv_id = int(it["id"]) if it.get("id") is not None else None
+        except Exception:
+            inv_id = None
+        it["azimuth"] = azimuth_map.get(inv_id) if inv_id is not None else None
+
+    return items
+
 
 # ---------- Фотоотчёты ----------
 @router.message(Command("shots"))
