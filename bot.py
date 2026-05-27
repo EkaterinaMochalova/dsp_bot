@@ -931,7 +931,9 @@ def _normalize_api_to_df(items: list[dict]) -> pd.DataFrame:
             "interpolated_ots":  it.get("interpolatedOts")  if it.get("interpolatedOts") is not None else g(it, ["metadata","otsInfo","interpolatedOts"]),
             "ssp_ots":           it.get("sspOts")           if it.get("sspOts") is not None else g(it, ["metadata","otsInfo","sspOts"]),
 
-            "azimuth":       it.get("azimuth"),
+            # azimuth: prefer value set by enrichment, then metadata.outDoorAzimuth, then direct field
+            "azimuth":       it.get("azimuth") if it.get("azimuth") is not None
+                             else g(it, ["metadata", "outDoorAzimuth"]),
             "image_url":     g(it, ["images", 0, "url"]),
             "image_preview": g(it, ["images", 0, "preview"]),
         })
@@ -1835,6 +1837,9 @@ async def cmd_sync_api(m: types.Message):
                 except ValueError:
                     pass
 
+    # azimuth_debug=1 -> dump first raw entry from impression-inventory-stats to chat
+    azimuth_debug = _get_opt("azimuth_debug", int, 0) == 1
+
     raw_api = {}
     for p in parts:
         if p.startswith("api.") and "=" in p:
@@ -1881,7 +1886,7 @@ async def cmd_sync_api(m: types.Message):
     if azimuth_campaign_ids:
         try:
             await m.answer(f"🧭 Догружаю азимут из impression-inventory-stats (кампании: {azimuth_campaign_ids})…")
-            items = await _enrich_items_with_azimuth(items, azimuth_campaign_ids, m=m)
+            items = await _enrich_items_with_azimuth(items, azimuth_campaign_ids, m=m, debug=azimuth_debug)
         except Exception as e:
             logging.exception("enrich azimuth failed")
             await m.answer(f"⚠️ Догрузка азимута частично не удалась: {e}")
@@ -2042,6 +2047,7 @@ async def _enrich_items_with_azimuth(
     campaign_ids: list[int],
     m: types.Message | None = None,
     page_size: int = 500,
+    debug: bool = False,
 ) -> list[dict]:
     if not campaign_ids:
         return items
@@ -2053,10 +2059,25 @@ async def _enrich_items_with_azimuth(
 
     azimuth_map: dict[int, Any] = {}
 
+    def _extract_azimuth(entry: dict) -> Any:
+        inv = entry.get("inventory") or {}
+        # Try all known paths in priority order:
+        # 1. inventory.metadata.outDoorAzimuth
+        az = (inv.get("metadata") or {}).get("outDoorAzimuth")
+        if az is not None:
+            return az
+        # 2. top-level entry metadata.outDoorAzimuth
+        az = (entry.get("metadata") or {}).get("outDoorAzimuth")
+        if az is not None:
+            return az
+        # 3. inventory.azimuth (direct field)
+        return inv.get("azimuth")
+
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for cid in campaign_ids:
             url = f"{base}/api/v1.0/clients/campaigns/{cid}/impression-inventory-stats"
             page = 0
+            first_page = True
             while True:
                 params: dict[str, Any] = {"page": page, "size": page_size}
                 try:
@@ -2081,14 +2102,17 @@ async def _enrich_items_with_azimuth(
                     page_items = data.get("content") or []
                     is_last = data.get("last", True)
 
+                # debug: dump first entry's raw JSON so we can see the real field path
+                if debug and first_page and page_items and m:
+                    sample = json.dumps(page_items[0], ensure_ascii=False, indent=2)[:1500]
+                    try: await m.answer(f"🔍 Пример записи (кампания {cid}):\n<pre>{sample}</pre>", parse_mode="HTML")
+                    except: pass
+                first_page = False
+
                 for entry in page_items:
                     inv = entry.get("inventory") or {}
                     inv_id = inv.get("id")
-                    # primary source: metadata.outDoorAzimuth; fallback: inventory.azimuth
-                    meta = entry.get("metadata") or {}
-                    azimuth = meta.get("outDoorAzimuth")
-                    if azimuth is None:
-                        azimuth = inv.get("azimuth")
+                    azimuth = _extract_azimuth(entry)
                     if inv_id is not None:
                         azimuth_map[int(inv_id)] = azimuth
 
