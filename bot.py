@@ -56,6 +56,9 @@ OBDSP_BASE = os.getenv("OBDSP_BASE", "https://obdsp.projects.eraga.net").strip()
 OBDSP_TOKEN = os.getenv("OBDSP_TOKEN", "").strip()
 OBDSP_AUTH_SCHEME = os.getenv("OBDSP_AUTH_SCHEME", "Bearer").strip()
 OBDSP_CLIENT_ID = os.getenv("OBDSP_CLIENT_ID", "").strip()
+# Token for impression-inventory-stats endpoint (may require different credentials).
+# Falls back to OBDSP_TOKEN if not set.
+OBDSP_STATS_TOKEN = os.getenv("OBDSP_STATS_TOKEN", "").strip() or OBDSP_TOKEN
 
 try:
     TELEGRAM_OWNER_ID = int(os.getenv("TELEGRAM_OWNER_ID", "0"))
@@ -2052,8 +2055,10 @@ async def _enrich_items_with_azimuth(
     if not campaign_ids:
         return items
 
-    base = (OBDSP_BASE or "https://proddsp.omniboard360.io").rstrip("/")
-    headers = {**_auth_headers(), "Accept": "application/json"}
+    # This endpoint lives on proddsp, not the staging base; use dedicated stats token.
+    base = "https://proddsp.omniboard360.io"
+    tok = OBDSP_STATS_TOKEN or OBDSP_TOKEN
+    headers = {"Authorization": f"Bearer {tok}", "Accept": "application/json"}
     ssl_param = _make_ssl_param_for_aiohttp()
     timeout = aiohttp.ClientTimeout(total=180)
 
