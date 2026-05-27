@@ -1966,6 +1966,8 @@ async def _enrich_items_with_ots_info(
             "estimatedOts": ots_info.get("estimatedOts"),
             "interpolatedOts": ots_info.get("interpolatedOts"),
             "sspOts": ots_info.get("sspOts"),
+            # grab azimuth from the same detail response
+            "outDoorAzimuth": md.get("outDoorAzimuth"),
         }
 
     base = (OBDSP_BASE or "https://proddsp.omniboard360.io").rstrip("/")
@@ -2034,10 +2036,14 @@ async def _enrich_items_with_ots_info(
             it["estimatedOts"] = None
             it["interpolatedOts"] = None
             it["sspOts"] = None
+            it.setdefault("azimuth", None)
         else:
             it["estimatedOts"] = info.get("estimatedOts")
             it["interpolatedOts"] = info.get("interpolatedOts")
             it["sspOts"] = info.get("sspOts")
+            # only set azimuth if not already populated by another source
+            if it.get("azimuth") is None:
+                it["azimuth"] = info.get("outDoorAzimuth")
 
     if m:
         await m.answer(f"✅ OTS догружен. Ошибок: {errors}/{total} (ретраебл: {retryable})")
