@@ -2084,7 +2084,11 @@ async def _enrich_items_with_azimuth(
                 for entry in page_items:
                     inv = entry.get("inventory") or {}
                     inv_id = inv.get("id")
-                    azimuth = inv.get("azimuth")
+                    # primary source: metadata.outDoorAzimuth; fallback: inventory.azimuth
+                    meta = entry.get("metadata") or {}
+                    azimuth = meta.get("outDoorAzimuth")
+                    if azimuth is None:
+                        azimuth = inv.get("azimuth")
                     if inv_id is not None:
                         azimuth_map[int(inv_id)] = azimuth
 
